@@ -10,7 +10,7 @@
   "scripts": {
     "crawl": "node src/cli.js",
     "test": "node --test",
-    "check": "node --check src/cli.js && node --check src/crawler.js && node --check src/extract.js && node --check src/robots.js && node --check src/url.js"
+    "check": "node --check src/cli.js && node --check src/crawler.js && node --check src/extract.js && node --check src/robots.js && node --check src/store.js && node --check src/transport.js && node --check src/url.js"
   },
   "dependencies": {
     "cheerio": "1.2.0",
