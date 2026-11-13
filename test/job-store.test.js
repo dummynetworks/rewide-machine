@@ -4,12 +4,25 @@ import {
   insertCrawlJob,
   getCrawlJob,
   updateCrawlJob,
+  insertCrawlPage,
+  getCrawlPage,
+  getCrawlPages,
+  saveDocumentAndCompletePage,
+  failCrawlPage,
+  finalizeCrawlJobIfIdle,
   saveDocumentAndCompleteJob,
   getDocument,
 } from '../src/job-store.js';
 
 function createFakeDb() {
-  const state = { jobs: new Map(), documents: new Map(), batches: [] };
+  const state = {
+    jobs: new Map(),
+    pages: new Map(),
+    documents: new Map(),
+    batches: [],
+  };
+
+  const pageKey = (jobId, url) => `${jobId}:${url}`;
 
   function statement(sql, values = []) {
     return {
@@ -17,17 +30,51 @@ function createFakeDb() {
         return statement(sql, bound);
       },
       async run() {
+        let changes = 0;
+
         if (sql.includes('INSERT INTO crawl_jobs')) {
-          const [id, url, , now] = values;
+          const [id, url, createdAt, updatedAt, maxPages, maxDepth] = values;
           state.jobs.set(id, {
             id, url, status: 'queued', attempts: 0,
-            created_at: now, updated_at: now,
+            created_at: createdAt, updated_at: updatedAt,
+            max_pages: maxPages, max_depth: maxDepth,
+            pages_crawled: 0, pages_failed: 0,
           });
+          changes = 1;
+        } else if (sql.includes('INSERT OR IGNORE INTO crawl_pages')) {
+          const [jobId, url, depth, parentUrl, createdAt, updatedAt] = values;
+          const job = state.jobs.get(jobId);
+          const key = pageKey(jobId, url);
+          const jobPageCount = [...state.pages.values()].filter((page) => page.job_id === jobId).length;
+          if (job && !state.pages.has(key) && jobPageCount < job.max_pages) {
+            state.pages.set(key, {
+              job_id: jobId, url, depth, status: 'queued', attempts: 0,
+              parent_url: parentUrl, created_at: createdAt, updated_at: updatedAt,
+            });
+            changes = 1;
+          }
+        } else if (sql.includes('UPDATE crawl_pages')) {
+          const jobId = values.at(-2);
+          const url = values.at(-1);
+          const page = state.pages.get(pageKey(jobId, url));
+          if (page) {
+            if (sql.includes("SET status = 'completed'")) page.status = 'completed';
+            if (sql.includes("SET status = 'failed'")) page.status = 'failed';
+            const fields = [...sql.matchAll(/([a-z_]+) = \?/g)].map((match) => match[1]);
+            fields.forEach((field, index) => { page[field] = values[index]; });
+            changes = 1;
+          }
         } else if (sql.includes('UPDATE crawl_jobs')) {
           const id = values.at(-1);
           const job = state.jobs.get(id);
           if (job) {
-            if (sql.includes("SET status = 'completed'")) {
+            if (sql.includes('pages_crawled = pages_crawled + 1')) {
+              job.pages_crawled += 1;
+              job.updated_at = values[0];
+            } else if (sql.includes('pages_failed = pages_failed + 1')) {
+              job.pages_failed += 1;
+              job.updated_at = values[0];
+            } else if (sql.includes("SET status = 'completed'")) {
               job.status = 'completed';
               job.updated_at = values[0];
               job.finished_at = values[1];
@@ -35,9 +82,10 @@ function createFakeDb() {
               job.error_code = null;
               job.error_message = null;
             } else {
-              const keys = [...sql.matchAll(/([a-z_]+) = \\?/g)].map((match) => match[1]);
-              keys.forEach((key, index) => { job[key] = values[index]; });
+              const fields = [...sql.matchAll(/([a-z_]+) = \?/g)].map((match) => match[1]);
+              fields.forEach((field, index) => { job[field] = values[index]; });
             }
+            changes = 1;
           }
         } else if (sql.includes('INSERT INTO documents')) {
           const [url, fetchedAt, httpStatus, contentType, title, description,
@@ -48,12 +96,34 @@ function createFakeDb() {
             canonicalUrl, language, text, linksJson, noIndex, noFollow,
             indexable, updatedAt,
           });
+          changes = 1;
         }
+
+        return { meta: { changes } };
       },
       async first() {
+        if (sql.includes('SUM(CASE WHEN status')) {
+          const pages = [...state.pages.values()].filter((page) => page.job_id === values[0]);
+          return {
+            active: pages.filter((page) => ['queued', 'running'].includes(page.status)).length,
+            completed: pages.filter((page) => page.status === 'completed').length,
+          };
+        }
         if (sql.includes('FROM crawl_jobs')) return state.jobs.get(values[0]) || null;
+        if (sql.includes('FROM crawl_pages')) return state.pages.get(pageKey(values[0], values[1])) || null;
         if (sql.includes('FROM documents')) return state.documents.get(values[0]) || null;
         return null;
+      },
+      async all() {
+        const pages = [...state.pages.values()].filter((page) => page.job_id === values[0]);
+        if (sql.includes("status = 'queued'")) {
+          return {
+            results: pages.filter((page) => page.status === 'queued').map((page) => ({
+              url: page.url, depth: page.depth, parentUrl: page.parent_url,
+            })),
+          };
+        }
+        return { results: pages };
       },
     };
   }
@@ -68,14 +138,35 @@ function createFakeDb() {
   };
 }
 
+const sampleDocument = {
+  url: 'https://example.com/',
+  fetchedAt: '2026-11-14T00:00:00.000Z',
+  httpStatus: 200,
+  contentType: 'text/html',
+  title: 'Example',
+  description: '',
+  canonicalUrl: null,
+  language: 'en',
+  text: 'Example body',
+  links: ['https://example.com/about'],
+  noIndex: false,
+  noFollow: false,
+  indexable: true,
+};
+
 test('insert and retrieve a queued crawl job', async () => {
   const db = createFakeDb();
   const job = await insertCrawlJob(db, {
-    id: 'job-1', url: 'https://example.com/', now: '2026-11-14T00:00:00.000Z',
+    id: 'job-1',
+    url: 'https://example.com/',
+    maxPages: 4,
+    maxDepth: 2,
+    now: '2026-11-14T00:00:00.000Z',
   });
 
   assert.equal(job.status, 'queued');
   assert.equal((await getCrawlJob(db, 'job-1')).url, 'https://example.com/');
+  assert.equal((await getCrawlJob(db, 'job-1')).max_pages, 4);
 });
 
 test('rejects unsupported job update fields', async () => {
@@ -86,33 +177,71 @@ test('rejects unsupported job update fields', async () => {
   );
 });
 
-test('stores a document and completes its job in one D1 batch', async () => {
+test('frontier deduplicates URLs and enforces the per-job page cap', async () => {
   const db = createFakeDb();
-  await insertCrawlJob(db, { id: 'job-2', url: 'https://example.com/' });
-  const document = {
+  await insertCrawlJob(db, {
+    id: 'job-frontier',
     url: 'https://example.com/',
-    fetchedAt: '2026-11-14T00:00:00.000Z',
-    httpStatus: 200,
-    contentType: 'text/html',
-    title: 'Example',
-    description: '',
-    canonicalUrl: null,
-    language: 'en',
-    text: 'Example body',
-    links: ['https://www.iana.org/domains/example'],
-    noIndex: false,
-    noFollow: false,
-    indexable: true,
-  };
+    maxPages: 2,
+    maxDepth: 1,
+  });
 
-  await saveDocumentAndCompleteJob(db, 'job-2', document, '2026-11-14T00:00:01.000Z');
-  const saved = await getDocument(db, document.url);
+  assert.equal(await insertCrawlPage(db, {
+    jobId: 'job-frontier', url: 'https://example.com/', depth: 0,
+  }), true);
+  assert.equal(await insertCrawlPage(db, {
+    jobId: 'job-frontier', url: 'https://example.com/about', depth: 1,
+  }), true);
+  assert.equal(await insertCrawlPage(db, {
+    jobId: 'job-frontier', url: 'https://example.com/about', depth: 1,
+  }), false);
+  assert.equal(await insertCrawlPage(db, {
+    jobId: 'job-frontier', url: 'https://example.com/contact', depth: 1,
+  }), false);
+
+  const pages = await getCrawlPages(db, 'job-frontier');
+  assert.equal(pages.length, 2);
+  assert.equal((await getCrawlPage(db, 'job-frontier', 'https://example.com/about')).depth, 1);
+});
+
+test('stores a page document and completes its frontier row in one D1 batch', async () => {
+  const db = createFakeDb();
+  await insertCrawlJob(db, { id: 'job-2', url: sampleDocument.url, maxPages: 1 });
+  await insertCrawlPage(db, { jobId: 'job-2', url: sampleDocument.url, depth: 0 });
+
+  await saveDocumentAndCompletePage(db, 'job-2', sampleDocument.url, sampleDocument);
+  const saved = await getDocument(db, sampleDocument.url);
+  const page = await getCrawlPage(db, 'job-2', sampleDocument.url);
   const job = await getCrawlJob(db, 'job-2');
 
   assert.equal(saved.title, 'Example');
-  assert.deepEqual(saved.links, document.links);
-  assert.equal(saved.indexable, true);
+  assert.deepEqual(saved.links, sampleDocument.links);
+  assert.equal(page.status, 'completed');
+  assert.equal(job.pages_crawled, 1);
+  assert.deepEqual(db.state.batches, [3]);
+});
+
+test('finalizes an idle crawl job based on successful pages', async () => {
+  const db = createFakeDb();
+  await insertCrawlJob(db, { id: 'job-3', url: sampleDocument.url });
+  await insertCrawlPage(db, { jobId: 'job-3', url: sampleDocument.url, depth: 0 });
+  await saveDocumentAndCompletePage(db, 'job-3', sampleDocument.url, sampleDocument);
+
+  assert.equal(await finalizeCrawlJobIfIdle(db, 'job-3'), true);
+  assert.equal((await getCrawlJob(db, 'job-3')).status, 'completed');
+});
+
+test('stores legacy document completion in one D1 batch', async () => {
+  const db = createFakeDb();
+  await insertCrawlJob(db, { id: 'job-legacy', url: sampleDocument.url });
+  await saveDocumentAndCompleteJob(db, 'job-legacy', sampleDocument, '2026-11-14T00:00:01.000Z');
+
+  const saved = await getDocument(db, sampleDocument.url);
+  const job = await getCrawlJob(db, 'job-legacy');
+
+  assert.equal(saved.title, 'Example');
+  assert.deepEqual(saved.links, sampleDocument.links);
   assert.equal(job.status, 'completed');
-  assert.equal(job.document_url, document.url);
+  assert.equal(job.document_url, sampleDocument.url);
   assert.deepEqual(db.state.batches, [2]);
 });
