@@ -31,6 +31,7 @@ export function selectCrawlLinks(links, {
         continue;
       }
 
+      url.hash = '';
       const normalized = url.href;
       if (seen.has(normalized)) continue;
       seen.add(normalized);
