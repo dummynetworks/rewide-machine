@@ -27,8 +27,17 @@ function createFakeDb() {
           const id = values.at(-1);
           const job = state.jobs.get(id);
           if (job) {
-            const keys = [...sql.matchAll(/([a-z_]+) = \?/g)].map((match) => match[1]);
-            keys.forEach((key, index) => { job[key] = values[index]; });
+            if (sql.includes("SET status = 'completed'")) {
+              job.status = 'completed';
+              job.updated_at = values[0];
+              job.finished_at = values[1];
+              job.document_url = values[2];
+              job.error_code = null;
+              job.error_message = null;
+            } else {
+              const keys = [...sql.matchAll(/([a-z_]+) = \\?/g)].map((match) => match[1]);
+              keys.forEach((key, index) => { job[key] = values[index]; });
+            }
           }
         } else if (sql.includes('INSERT INTO documents')) {
           const [url, fetchedAt, httpStatus, contentType, title, description,
