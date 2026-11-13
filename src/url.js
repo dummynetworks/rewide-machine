@@ -108,3 +108,10 @@ export async function assertPublicDestination(input, lookupFn = lookup) {
 
   return normalized;
 }
+
+export function isPublicIpAddress(address) {
+  const version = isIP(address);
+  if (version === 4) return !isPrivateIPv4(address);
+  if (version === 6) return !isPrivateIPv6(address);
+  return false;
+}
