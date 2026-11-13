@@ -1,0 +1,9 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rewide-machine",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-14",
+  "observability": {
+    "enabled": true
+  }
+}
