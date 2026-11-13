@@ -270,7 +270,7 @@ function collectDocument(htmlResponse, finalUrl) {
   });
 }
 
-async function crawlOne(input) {
+async function crawlOne(input, { allowedOrigin = null } = {}) {
   let target = normalizePublicUrl(input);
   if (!target) {
     return { error: 'INVALID_URL', message: 'Only public HTTP and HTTPS URLs on standard ports are accepted.' };
@@ -303,6 +303,9 @@ async function crawlOne(input) {
       target = normalizePublicUrl(location, target);
       if (!target) {
         return { error: 'INVALID_REDIRECT', message: 'Redirect target is not an allowed public HTTP URL.' };
+      }
+      if (allowedOrigin && new URL(target).origin !== allowedOrigin) {
+        return { error: 'CROSS_ORIGIN_REDIRECT', message: 'Recursive crawl redirects must remain on the starting origin.' };
       }
       continue;
     }
@@ -472,7 +475,7 @@ async function handleQueueMessage(message, env) {
       error_message: null,
     });
 
-    const result = await crawlOne(pageUrl);
+    const result = await crawlOne(pageUrl, { allowedOrigin: new URL(job.url).origin });
     if (result.error) {
       await failCrawlPage(env.DB, body.jobId, pageUrl, {
         attempts: message.attempts,
@@ -484,7 +487,7 @@ async function handleQueueMessage(message, env) {
       return;
     }
 
-    const currentDepth = Number(page.depth || depthFromMessage);
+    const currentDepth = Number.isInteger(page.depth) ? page.depth : depthFromMessage;
     const candidates = selectCrawlLinks(result.links, {
       rootUrl: job.url,
       currentUrl: pageUrl,
