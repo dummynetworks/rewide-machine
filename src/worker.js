@@ -1,5 +1,6 @@
 import { createRobotsPolicy } from './robots.js';
-import { insertCrawlJob, getCrawlJob, updateCrawlJob, saveDocumentAndCompleteJob, getDocument } from './job-store.js';
+import { insertCrawlJob, getCrawlJob, updateCrawlJob, insertCrawlPage, getCrawlPage, getCrawlPages, listQueuedCrawlPages, updateCrawlPage, saveDocumentAndCompletePage, failCrawlPage, finalizeCrawlJobIfIdle, getDocument } from './job-store.js';
+import { selectCrawlLinks } from './frontier.js';
 
 const USER_AGENT = 'rewidebot/0.1';
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
@@ -415,13 +416,54 @@ async function handleQueueMessage(message, env) {
     return;
   }
 
+  const depthFromMessage = Number.isInteger(body.depth) ? body.depth : 0;
+  if (depthFromMessage < 0 || depthFromMessage > 5) {
+    message.ack();
+    return;
+  }
+
+  let pageUrl = body.url;
   try {
     const job = await getCrawlJob(env.DB, body.jobId);
-    if (!job || job.status === 'completed' || job.status === 'failed') {
+    if (!job) {
       message.ack();
       return;
     }
 
+    if (job.status === 'completed' || job.status === 'failed') {
+      message.ack();
+      return;
+    }
+
+    let page = await getCrawlPage(env.DB, body.jobId, pageUrl);
+    if (!page) {
+      await insertCrawlPage(env.DB, {
+        jobId: body.jobId,
+        url: pageUrl,
+        depth: depthFromMessage,
+        parentUrl: typeof body.parentUrl === 'string' ? body.parentUrl : null,
+      });
+      page = await getCrawlPage(env.DB, body.jobId, pageUrl);
+    }
+
+    if (!page) {
+      message.ack();
+      return;
+    }
+
+    if (page.status === 'completed' || page.status === 'failed') {
+      await finalizeCrawlJobIfIdle(env.DB, body.jobId);
+      message.ack();
+      return;
+    }
+
+    await updateCrawlPage(env.DB, body.jobId, pageUrl, {
+      status: 'running',
+      attempts: message.attempts,
+      updated_at: new Date().toISOString(),
+      error_code: null,
+      error_message: null,
+    });
     await updateCrawlJob(env.DB, body.jobId, {
       status: 'running',
       attempts: message.attempts,
@@ -430,36 +472,68 @@ async function handleQueueMessage(message, env) {
       error_message: null,
     });
 
-    const result = await crawlOne(body.url);
+    const result = await crawlOne(pageUrl);
     if (result.error) {
-      const now = new Date().toISOString();
-      await updateCrawlJob(env.DB, body.jobId, {
-        status: 'failed',
+      await failCrawlPage(env.DB, body.jobId, pageUrl, {
         attempts: message.attempts,
-        updated_at: now,
-        finished_at: now,
-        error_code: result.error,
-        error_message: result.message || result.error,
+        errorCode: result.error,
+        errorMessage: result.message || result.error,
       });
+      await finalizeCrawlJobIfIdle(env.DB, body.jobId);
       message.ack();
       return;
     }
 
-    await saveDocumentAndCompleteJob(env.DB, body.jobId, result);
+    const currentDepth = Number(page.depth || depthFromMessage);
+    const candidates = selectCrawlLinks(result.links, {
+      rootUrl: job.url,
+      currentUrl: pageUrl,
+      depth: currentDepth,
+      maxDepth: Number(job.max_depth || 0),
+      limit: 50,
+    });
+
+    for (const candidate of candidates) {
+      await insertCrawlPage(env.DB, {
+        jobId: body.jobId,
+        url: candidate.url,
+        depth: candidate.depth,
+        parentUrl: candidate.parentUrl,
+      });
+    }
+
+    // Re-publishing queued rows makes enqueueing recoverable if a previous
+    // delivery failed after the frontier rows were inserted into D1.
+    const queuedPages = await listQueuedCrawlPages(env.DB, body.jobId);
+    for (const queuedPage of queuedPages) {
+      await env.CRAWL_QUEUE.send({
+        jobId: body.jobId,
+        url: queuedPage.url,
+        depth: queuedPage.depth,
+        parentUrl: queuedPage.parentUrl,
+      });
+    }
+
+    await saveDocumentAndCompletePage(env.DB, body.jobId, pageUrl, result);
+    await finalizeCrawlJobIfIdle(env.DB, body.jobId);
     message.ack();
   } catch (error) {
     const messageText = error instanceof Error ? error.message.slice(0, 500) : 'Unexpected queue consumer error.';
+    const currentPage = await getCrawlPage(env.DB, body.jobId, pageUrl).catch(() => null);
+
+    if (currentPage?.status === 'completed' || currentPage?.status === 'failed') {
+      message.retry({ delaySeconds: 15 });
+      return;
+    }
+
     if (message.attempts >= 5) {
       try {
-        const now = new Date().toISOString();
-        await updateCrawlJob(env.DB, body.jobId, {
-          status: 'failed',
+        await failCrawlPage(env.DB, body.jobId, pageUrl, {
           attempts: message.attempts,
-          updated_at: now,
-          finished_at: now,
-          error_code: 'RETRY_LIMIT_EXCEEDED',
-          error_message: messageText,
+          errorCode: 'RETRY_LIMIT_EXCEEDED',
+          errorMessage: messageText,
         });
+        await finalizeCrawlJobIfIdle(env.DB, body.jobId);
         message.ack();
       } catch {
         message.retry({ delaySeconds: 900 });
@@ -468,6 +542,13 @@ async function handleQueueMessage(message, env) {
     }
 
     try {
+      await updateCrawlPage(env.DB, body.jobId, pageUrl, {
+        status: 'queued',
+        attempts: message.attempts,
+        updated_at: new Date().toISOString(),
+        error_code: 'TEMPORARY_FAILURE',
+        error_message: messageText,
+      });
       await updateCrawlJob(env.DB, body.jobId, {
         status: 'queued',
         attempts: message.attempts,
@@ -476,14 +557,13 @@ async function handleQueueMessage(message, env) {
         error_message: messageText,
       });
     } catch {
-      // The queue retry remains the source of truth if D1 is temporarily unavailable.
+      // The Queue retry remains the source of truth if D1 is temporarily unavailable.
     }
 
     const delaySeconds = Math.min(900, 15 * (2 ** Math.max(0, message.attempts - 1)));
     message.retry({ delaySeconds });
   }
 }
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -494,11 +574,12 @@ export default {
         bot: USER_AGENT,
         status: 'ok',
         runtime: 'cloudflare-workers',
-        version: '0.2.0',
+        version: '0.3.0',
         capabilities: {
           queue: Boolean(env.CRAWL_QUEUE),
           database: Boolean(env.DB),
           asyncCrawl: Boolean(env.CRAWL_QUEUE && env.DB),
+          recursiveCrawl: true,
         },
       });
     }
@@ -514,6 +595,16 @@ export default {
         }
       }
       return json({ error: 'UNAUTHORIZED' }, 401, { 'www-authenticate': 'Bearer' });
+    }
+
+    const pagesMatch = url.pathname.match(/^\\/v1\\/jobs\\/([0-9a-f-]{36})\\/pages$/i);
+    if (request.method === 'GET' && pagesMatch) {
+      if (!env.DB) return json({ error: 'DATABASE_NOT_CONFIGURED' }, 503);
+      const jobId = pagesMatch[1];
+      const job = await getCrawlJob(env.DB, jobId);
+      if (!job) return json({ error: 'JOB_NOT_FOUND' }, 404);
+      const pages = await getCrawlPages(env.DB, jobId);
+      return json({ jobId, count: pages.length, pages });
     }
 
     if (request.method === 'GET' && url.pathname.startsWith('/v1/jobs/')) {
@@ -551,27 +642,55 @@ export default {
       const checked = requestUrl(parsed.payload);
       if (checked.error) return json({ error: checked.error, message: checked.message }, 400);
 
+      const requestedMaxPages = parsed.payload?.maxPages ?? 1;
+      const requestedMaxDepth = parsed.payload?.maxDepth ?? (requestedMaxPages > 1 ? 2 : 0);
+      if (
+        !Number.isInteger(requestedMaxPages)
+        || requestedMaxPages < 1
+        || requestedMaxPages > 50
+        || !Number.isInteger(requestedMaxDepth)
+        || requestedMaxDepth < 0
+        || requestedMaxDepth > 5
+      ) {
+        return json({
+          error: 'INVALID_CRAWL_LIMITS',
+          message: 'maxPages must be an integer from 1 to 50; maxDepth must be an integer from 0 to 5.',
+        }, 400);
+      }
+
       const jobId = crypto.randomUUID();
       const now = new Date().toISOString();
       try {
-        await insertCrawlJob(env.DB, { id: jobId, url: checked.url, now });
-        await env.CRAWL_QUEUE.send({ jobId, url: checked.url });
+        await insertCrawlJob(env.DB, {
+          id: jobId,
+          url: checked.url,
+          maxPages: requestedMaxPages,
+          maxDepth: requestedMaxDepth,
+          now,
+        });
+        await insertCrawlPage(env.DB, {
+          jobId,
+          url: checked.url,
+          depth: 0,
+          parentUrl: null,
+          now,
+        });
+        await env.CRAWL_QUEUE.send({ jobId, url: checked.url, depth: 0, parentUrl: null });
       } catch (error) {
         try {
-          await updateCrawlJob(env.DB, jobId, {
-            status: 'failed',
-            updated_at: new Date().toISOString(),
-            finished_at: new Date().toISOString(),
-            error_code: 'QUEUE_ENQUEUE_FAILED',
-            error_message: error instanceof Error ? error.message.slice(0, 500) : 'Unable to enqueue crawl job.',
+          await failCrawlPage(env.DB, jobId, checked.url, {
+            attempts: 0,
+            errorCode: 'QUEUE_ENQUEUE_FAILED',
+            errorMessage: error instanceof Error ? error.message.slice(0, 500) : 'Unable to enqueue crawl job.',
           });
+          await finalizeCrawlJobIfIdle(env.DB, jobId);
         } catch {
           // Preserve the original enqueue failure response.
         }
         return json({ error: 'QUEUE_ENQUEUE_FAILED' }, 503);
       }
 
-      return json({ jobId, url: checked.url, status: 'queued', createdAt: now }, 202);
+      return json({ jobId, url: checked.url, status: 'queued', createdAt: now, maxPages: requestedMaxPages, maxDepth: requestedMaxDepth, scope: 'same-origin' }, 202);
     }
 
     return json({ error: 'NOT_FOUND' }, 404);
