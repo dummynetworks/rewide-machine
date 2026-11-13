@@ -2,49 +2,51 @@ import { lookup } from 'node:dns';
 import { Agent, fetch as undiciFetch } from 'undici';
 import { isPublicIpAddress } from './url.js';
 
-function publicLookup(hostname, options, callback) {
-  let lookupOptions = options;
-  let done = callback;
+export function createPublicLookup(resolver = lookup) {
+  return function publicLookup(hostname, options, callback) {
+    let lookupOptions = options;
+    let done = callback;
 
-  if (typeof lookupOptions === 'function') {
-    done = lookupOptions;
-    lookupOptions = {};
-  }
-
-  lookup(hostname, { all: true, verbatim: true }, (error, records) => {
-    if (error) {
-      done(error);
-      return;
+    if (typeof lookupOptions === 'function') {
+      done = lookupOptions;
+      lookupOptions = {};
     }
 
-    if (!Array.isArray(records) || records.length === 0) {
-      done(new Error(`No address records returned for ${hostname}.`));
-      return;
-    }
+    resolver(hostname, { all: true, verbatim: true }, (error, records) => {
+      if (error) {
+        done(error);
+        return;
+      }
 
-    if (records.some((record) => !isPublicIpAddress(record.address))) {
-      done(new Error(`Refusing non-public DNS answers for ${hostname}.`));
-      return;
-    }
+      if (!Array.isArray(records) || records.length === 0) {
+        done(new Error(`No address records returned for ${hostname}.`));
+        return;
+      }
 
-    const family = lookupOptions?.family ?? 0;
-    const matching = family
-      ? records.filter((record) => record.family === family)
-      : records;
+      if (records.some((record) => !isPublicIpAddress(record.address))) {
+        done(new Error(`Refusing non-public DNS answers for ${hostname}.`));
+        return;
+      }
 
-    if (matching.length === 0) {
-      done(new Error(`No address records for requested IP family: ${hostname}.`));
-      return;
-    }
+      const family = lookupOptions?.family ?? 0;
+      const matching = family
+        ? records.filter((record) => record.family === family)
+        : records;
 
-    if (lookupOptions?.all) {
-      done(null, matching);
-      return;
-    }
+      if (matching.length === 0) {
+        done(new Error(`No address records for requested IP family: ${hostname}.`));
+        return;
+      }
 
-    const selected = matching[0];
-    done(null, selected.address, selected.family);
-  });
+      if (lookupOptions?.all) {
+        done(null, matching);
+        return;
+      }
+
+      const selected = matching[0];
+      done(null, selected.address, selected.family);
+    });
+  };
 }
 
 export function createCrawlerTransport() {
@@ -52,7 +54,7 @@ export function createCrawlerTransport() {
     connections: 1,
     maxOrigins: 256,
     connect: {
-      lookup: publicLookup,
+      lookup: createPublicLookup(),
     },
   });
 
