@@ -235,7 +235,7 @@ function collectDocument(htmlResponse, finalUrl) {
         }
       },
     })
-    .on('body', {
+    .on('body, body *', {
       text(chunk) {
         document.text = addText(document.text, chunk.text, MAX_TEXT_LENGTH);
       },
@@ -386,9 +386,16 @@ export default {
       return json({ error: 'UNAUTHORIZED' }, 401, { 'www-authenticate': 'Bearer' });
     }
 
+    const declaredBodyLength = Number(request.headers.get('content-length'));
+    if (Number.isFinite(declaredBodyLength) && declaredBodyLength > 4_096) {
+      return json({ error: 'REQUEST_TOO_LARGE' }, 413);
+    }
+
     let payload;
     try {
-      payload = await request.json();
+      const body = await request.text();
+      if (body.length > 4_096) return json({ error: 'REQUEST_TOO_LARGE' }, 413);
+      payload = JSON.parse(body);
     } catch {
       return json({ error: 'INVALID_JSON' }, 400);
     }
