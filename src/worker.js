@@ -597,7 +597,7 @@ export default {
       return json({ error: 'UNAUTHORIZED' }, 401, { 'www-authenticate': 'Bearer' });
     }
 
-    const pagesMatch = url.pathname.match(/^\\/v1\\/jobs\\/([0-9a-f-]{36})\\/pages$/i);
+    const pagesMatch = url.pathname.match(/^\/v1\/jobs\/([0-9a-f-]{36})\/pages$/i);
     if (request.method === 'GET' && pagesMatch) {
       if (!env.DB) return json({ error: 'DATABASE_NOT_CONFIGURED' }, 503);
       const jobId = pagesMatch[1];
