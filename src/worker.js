@@ -1,5 +1,5 @@
 import { createRobotsPolicy } from './robots.js';
-import { insertCrawlJob, getCrawlJob, updateCrawlJob, insertCrawlPage, getCrawlPage, getCrawlPages, listQueuedCrawlPages, updateCrawlPage, saveDocumentAndCompletePage, failCrawlPage, finalizeCrawlJobIfIdle, getDocument } from './job-store.js';
+import { insertCrawlJob, getCrawlJob, updateCrawlJob, insertCrawlPage, getCrawlPage, getCrawlPages, updateCrawlPage, saveDocumentAndCompletePage, failCrawlPage, finalizeCrawlJobIfIdle, getDocument } from './job-store.js';
 import { selectCrawlLinks } from './frontier.js';
 
 const USER_AGENT = 'rewidebot/0.1';
@@ -500,18 +500,18 @@ async function handleQueueMessage(message, env) {
         depth: candidate.depth,
         parentUrl: candidate.parentUrl,
       });
-    }
 
-    // Re-publishing queued rows makes enqueueing recoverable if a previous
-    // delivery failed after the frontier rows were inserted into D1.
-    const queuedPages = await listQueuedCrawlPages(env.DB, body.jobId);
-    for (const queuedPage of queuedPages) {
-      await env.CRAWL_QUEUE.send({
-        jobId: body.jobId,
-        url: queuedPage.url,
-        depth: queuedPage.depth,
-        parentUrl: queuedPage.parentUrl,
-      });
+      // Re-send only this page's queued discoveries. If a prior delivery
+      // failed after the D1 insert, retrying the parent can publish them.
+      const discoveredPage = await getCrawlPage(env.DB, body.jobId, candidate.url);
+      if (discoveredPage?.status === 'queued') {
+        await env.CRAWL_QUEUE.send({
+          jobId: body.jobId,
+          url: candidate.url,
+          depth: candidate.depth,
+          parentUrl: candidate.parentUrl,
+        });
+      }
     }
 
     await saveDocumentAndCompletePage(env.DB, body.jobId, pageUrl, result);
