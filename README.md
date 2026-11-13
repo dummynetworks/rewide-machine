@@ -93,6 +93,7 @@ npx wrangler d1 migrations apply rewide-machine-db --remote
 Migrations:
 - `0001_initial.sql` creates `crawl_jobs` and `documents`.
 - `0002_recursive_crawl.sql` adds crawl limits and page counters to `crawl_jobs`, and creates the per-job `crawl_pages` frontier.
+- `0003_documents_fts.sql` creates a SQLite FTS5 full-text index over document titles, descriptions, and extracted text. Triggers keep it synchronized with document inserts, updates, and deletes; the migration rebuilds the index from documents already stored.
 
 After the Queue exists and migrations have been applied, deploy the Worker. Wrangler configures the producer binding `CRAWL_QUEUE` and the consumer for `rewide-crawl-queue` from `wrangler.jsonc`.
 
@@ -112,7 +113,7 @@ Until the Queue binding and D1 tables are available, `GET /health` reports missi
 
 Queue delivery is at-least-once. Duplicate messages are acknowledged when their frontier page is already terminal; document writes are URL-keyed upserts. If publishing a discovered child fails after its frontier row was inserted, retrying the parent can publish that still-queued child again.
 
-This is a bounded same-origin crawler, not yet a search index. It does not crawl external domains, execute JavaScript, render browser-only pages, or provide sitemap-driven discovery.
+This is a bounded same-origin crawler with a D1 FTS5 document index. The index is queried by the separate rewide Pages search API; the crawler itself does not expose a public search endpoint. It does not crawl external domains, execute JavaScript, render browser-only pages, or provide sitemap-driven discovery.
 
 ## Local development
 
