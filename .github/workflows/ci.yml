@@ -29,3 +29,6 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Validate Worker bundle
+        run: npm run deploy:dry-run
