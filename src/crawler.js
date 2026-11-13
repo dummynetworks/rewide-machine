@@ -2,6 +2,7 @@ import { createConfig } from './config.js';
 import { extractDocument, extractSitemapLocations } from './extract.js';
 import { createRobotsPolicy } from './robots.js';
 import { createPageStore } from './store.js';
+import { createCrawlerTransport } from './transport.js';
 import { assertPublicDestination, normalizeUrl } from './url.js';
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -44,7 +45,9 @@ async function readLimitedBody(response, maximumBytes) {
 export class RewideCrawler {
   constructor(options = {}) {
     this.config = createConfig(options.config);
-    this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
+    this.transport = options.fetchImpl ? null : createCrawlerTransport();
+    this.fetchImpl = options.fetchImpl ?? this.transport.fetch;
+    this.lookupFn = options.lookupFn;
     this.onEvent = options.onEvent ?? (() => {});
     this.robotsCache = new Map();
     this.lastRequestAt = new Map();
@@ -53,6 +56,10 @@ export class RewideCrawler {
 
   emit(type, details = {}) {
     this.onEvent({ type, at: new Date().toISOString(), ...details });
+  }
+
+  async close() {
+    await this.transport?.close();
   }
 
   async waitForOrigin(origin) {
@@ -75,7 +82,7 @@ export class RewideCrawler {
     if (!target) throw new TypeError('Refusing an unsafe or unsupported URL.');
 
     for (let redirectCount = 0; redirectCount <= this.config.maxRedirects; redirectCount += 1) {
-      target = await assertPublicDestination(target);
+      target = await assertPublicDestination(target, this.lookupFn);
       const origin = new URL(target).origin;
       await this.waitForOrigin(origin);
 
