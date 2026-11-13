@@ -36,6 +36,8 @@ function isPrivateIPv6(address) {
   const value = address.toLowerCase().split('%')[0];
 
   if (value === '::' || value === '::1') return true;
+  if (value.startsWith('::ffff:')) return true;
+  if (value.startsWith('2001:db8:')) return true;
   if (value.startsWith('fc') || value.startsWith('fd')) return true;
   if (/^fe[89ab]/.test(value) || value.startsWith('ff')) return true;
 
