@@ -1,0 +1,19 @@
+{
+  "name": "rewide-machine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The independent crawling and document extraction engine for rewide.",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "crawl": "node src/cli.js",
+    "test": "node --test",
+    "check": "node --check src/cli.js && node --check src/crawler.js && node --check src/extract.js && node --check src/robots.js && node --check src/url.js"
+  },
+  "dependencies": {
+    "cheerio": "1.2.0",
+    "robots-parser": "3.0.1"
+  }
+}
