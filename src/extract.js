@@ -17,15 +17,22 @@ const REMOVE_SELECTORS = [
   '[aria-hidden="true"]',
 ];
 
-function directiveSet(value) {
-  return new Set(
-    String(value ?? '')
-      .toLowerCase()
-      .replace(/^[^:]+:\s*/, '')
-      .split(/[;,\s]+/)
-      .map((item) => item.trim())
-      .filter(Boolean),
-  );
+function directiveSet(...values) {
+  const directives = new Set();
+
+  for (const value of values) {
+    for (const entry of String(value ?? '').toLowerCase().split(/[;,]+/)) {
+      const separator = entry.indexOf(':');
+      const directiveText = separator >= 0 ? entry.slice(separator + 1) : entry;
+
+      for (const token of directiveText.split(/\\s+/)) {
+        const directive = token.trim();
+        if (directive) directives.add(directive);
+      }
+    }
+  }
+
+  return directives;
 }
 
 export function extractDocument(input, pageUrl, headers = new Headers(), options = {}) {
@@ -58,7 +65,7 @@ export function extractDocument(input, pageUrl, headers = new Headers(), options
     $('meta[name="rewidebot"]').attr('content'),
   ].filter(Boolean).join(' ');
   const headerRobots = headers.get('x-robots-tag') ?? '';
-  const directives = directiveSet(`${metaRobots} ${headerRobots}`);
+  const directives = directiveSet(metaRobots, headerRobots);
 
   const noIndex = directives.has('noindex') || directives.has('none');
   const noFollow = directives.has('nofollow') || directives.has('none');
