@@ -2,6 +2,7 @@
   "name": "rewide-machine",
   "version": "0.1.0",
   "private": true,
+  "license": "BSD-3-Clause",
   "type": "module",
   "description": "The independent crawling and document extraction engine for rewide.",
   "engines": {
