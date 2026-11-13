@@ -77,11 +77,12 @@ export class RewideCrawler {
     this.lastRequestAt.set(origin, Date.now());
   }
 
-  async request(input, { accept, maximumBytes }) {
+  async request(input, { accept, maximumBytes, beforeRequest }) {
     let target = normalizeUrl(input);
     if (!target) throw new TypeError('Refusing an unsafe or unsupported URL.');
 
     for (let redirectCount = 0; redirectCount <= this.config.maxRedirects; redirectCount += 1) {
+      await beforeRequest?.(target);
       target = await assertPublicDestination(target, this.lookupFn);
       const origin = new URL(target).origin;
       await this.waitForOrigin(origin);
@@ -188,6 +189,12 @@ export class RewideCrawler {
       const result = await this.request(item.url, {
         accept: 'application/xml,text/xml,application/x-gzip,*/*;q=0.1',
         maximumBytes: this.config.maxResponseBytes,
+        beforeRequest: async (target) => {
+          const policy = await this.getRobotsPolicy(target, queue, queued);
+          if (!policy.allowed(target)) {
+            throw new Error('Sitemap target is disallowed by its robots.txt policy.');
+          }
+        },
       });
 
       if (!result.response.ok || result.tooLarge || !result.body) {
@@ -300,6 +307,12 @@ export class RewideCrawler {
         const result = await this.request(item.url, {
           accept: 'text/html,application/xhtml+xml;q=0.9',
           maximumBytes: this.config.maxResponseBytes,
+          beforeRequest: async (target) => {
+            const destinationPolicy = await this.getRobotsPolicy(target, queue, queued);
+            if (!destinationPolicy.allowed(target)) {
+              throw new Error('Redirect target is disallowed by its robots.txt policy.');
+            }
+          },
         });
 
         if (!result.response.ok || result.tooLarge || !result.body) {
@@ -375,6 +388,7 @@ export class RewideCrawler {
       }
     }
 
+    stats.discovered = queued.size;
     this.emit('crawl-complete', stats);
     return stats;
   }
