@@ -13,5 +13,22 @@
       "database_id": "323d7bb9-e7a7-439e-944e-cf0f7b27f8cb",
       "migrations_dir": "migrations"
     }
-  ]
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "CRAWL_QUEUE",
+        "queue": "rewide-crawl-queue"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "rewide-crawl-queue",
+        "max_batch_size": 5,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "max_concurrency": 1
+      }
+    ]
+  }
 }
