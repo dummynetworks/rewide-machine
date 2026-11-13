@@ -27,7 +27,9 @@ export function createConfig(overrides = {}) {
   }
 
   positiveInteger('maxPages', config.maxPages, 100_000);
-  positiveInteger('maxDepth', config.maxDepth, 20);
+  if (!Number.isSafeInteger(config.maxDepth) || config.maxDepth < 0 || config.maxDepth > 20) {
+    throw new RangeError('maxDepth must be an integer between 0 and 20.');
+  }
   positiveInteger('requestTimeoutMs', config.requestTimeoutMs, 120_000);
   positiveInteger('maxResponseBytes', config.maxResponseBytes, 20 * 1024 * 1024);
   positiveInteger('maxRobotsBytes', config.maxRobotsBytes, 2 * 1024 * 1024);
