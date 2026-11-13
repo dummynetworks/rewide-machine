@@ -1,4 +1,5 @@
 import { createRobotsPolicy } from './robots.js';
+import { insertCrawlJob, getCrawlJob, updateCrawlJob, saveDocumentAndCompleteJob, getDocument } from './job-store.js';
 
 const USER_AGENT = 'rewidebot/0.1';
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
@@ -360,6 +361,129 @@ async function authorized(request, env) {
   return difference === 0;
 }
 
+function requestUrl(payload) {
+  if (!payload || typeof payload.url !== 'string' || payload.url.length > 2_048) {
+    return { error: 'INVALID_REQUEST', message: 'Provide one URL string in the url field.' };
+  }
+  const url = normalizePublicUrl(payload.url);
+  if (!url) {
+    return { error: 'INVALID_URL', message: 'Only public HTTP and HTTPS URLs on standard ports are accepted.' };
+  }
+  return { url };
+}
+
+async function readJsonBody(request) {
+  const declaredBodyLength = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declaredBodyLength) && declaredBodyLength > 4_096) {
+    return { error: 'REQUEST_TOO_LARGE' };
+  }
+  try {
+    const body = await request.text();
+    if (body.length > 4_096) return { error: 'REQUEST_TOO_LARGE' };
+    return { payload: JSON.parse(body) };
+  } catch {
+    return { error: 'INVALID_JSON' };
+  }
+}
+
+async function crawlOnceResponse(payload) {
+  const checked = requestUrl(payload);
+  if (checked.error) {
+    return json({ error: checked.error, message: checked.message }, checked.error === 'INVALID_URL' ? 400 : 400);
+  }
+
+  try {
+    const result = await crawlOne(checked.url);
+    const status = result.error
+      ? (result.error === 'ROBOTS_DISALLOWED' ? 403
+        : result.error === 'INVALID_URL' || result.error === 'INVALID_REDIRECT' ? 400
+          : result.error === 'UPSTREAM_HTTP_ERROR' ? 502 : 422)
+      : 200;
+    return json(result, status);
+  } catch (error) {
+    return json({
+      error: 'CRAWL_FAILED',
+      message: error instanceof Error ? error.message : 'Unexpected crawler error.',
+    }, 502);
+  }
+}
+
+async function handleQueueMessage(message, env) {
+  const body = message.body;
+  if (!body || typeof body.jobId !== 'string' || typeof body.url !== 'string') {
+    message.ack();
+    return;
+  }
+
+  try {
+    const job = await getCrawlJob(env.DB, body.jobId);
+    if (!job || job.status === 'completed' || job.status === 'failed') {
+      message.ack();
+      return;
+    }
+
+    await updateCrawlJob(env.DB, body.jobId, {
+      status: 'running',
+      attempts: message.attempts,
+      updated_at: new Date().toISOString(),
+      error_code: null,
+      error_message: null,
+    });
+
+    const result = await crawlOne(body.url);
+    if (result.error) {
+      const now = new Date().toISOString();
+      await updateCrawlJob(env.DB, body.jobId, {
+        status: 'failed',
+        attempts: message.attempts,
+        updated_at: now,
+        finished_at: now,
+        error_code: result.error,
+        error_message: result.message || result.error,
+      });
+      message.ack();
+      return;
+    }
+
+    await saveDocumentAndCompleteJob(env.DB, body.jobId, result);
+    message.ack();
+  } catch (error) {
+    const messageText = error instanceof Error ? error.message.slice(0, 500) : 'Unexpected queue consumer error.';
+    if (message.attempts >= 5) {
+      try {
+        const now = new Date().toISOString();
+        await updateCrawlJob(env.DB, body.jobId, {
+          status: 'failed',
+          attempts: message.attempts,
+          updated_at: now,
+          finished_at: now,
+          error_code: 'RETRY_LIMIT_EXCEEDED',
+          error_message: messageText,
+        });
+        message.ack();
+      } catch {
+        message.retry({ delaySeconds: 900 });
+      }
+      return;
+    }
+
+    try {
+      await updateCrawlJob(env.DB, body.jobId, {
+        status: 'queued',
+        attempts: message.attempts,
+        updated_at: new Date().toISOString(),
+        error_code: 'TEMPORARY_FAILURE',
+        error_message: messageText,
+      });
+    } catch {
+      // The queue retry remains the source of truth if D1 is temporarily unavailable.
+    }
+
+    const delaySeconds = Math.min(900, 15 * (2 ** Math.max(0, message.attempts - 1)));
+    message.retry({ delaySeconds });
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -370,54 +494,97 @@ export default {
         bot: USER_AGENT,
         status: 'ok',
         runtime: 'cloudflare-workers',
-        version: '0.1.0',
+        version: '0.2.0',
+        capabilities: {
+          queue: Boolean(env.CRAWL_QUEUE),
+          database: Boolean(env.DB),
+          asyncCrawl: Boolean(env.CRAWL_QUEUE && env.DB),
+        },
       });
     }
 
-    if (url.pathname !== '/v1/crawl' || request.method !== 'POST') {
-      return json({ error: 'NOT_FOUND' }, 404);
-    }
-
-    if (!env.DUMMYNET_TOKEN) {
-      return json({ error: 'NOT_CONFIGURED', message: 'DUMMYNET_TOKEN secret is required.' }, 503);
+    if (!['GET', 'POST'].includes(request.method)) {
+      return json({ error: 'METHOD_NOT_ALLOWED' }, 405, { allow: 'GET, POST' });
     }
 
     if (!await authorized(request, env)) {
+      if (request.method === 'POST' && url.pathname === '/v1/crawl') {
+        if (!env.DUMMYNET_TOKEN) {
+          return json({ error: 'NOT_CONFIGURED', message: 'DUMMYNET_TOKEN secret is required.' }, 503);
+        }
+      }
       return json({ error: 'UNAUTHORIZED' }, 401, { 'www-authenticate': 'Bearer' });
     }
 
-    const declaredBodyLength = Number(request.headers.get('content-length'));
-    if (Number.isFinite(declaredBodyLength) && declaredBodyLength > 4_096) {
-      return json({ error: 'REQUEST_TOO_LARGE' }, 413);
+    if (request.method === 'GET' && url.pathname.startsWith('/v1/jobs/')) {
+      if (!env.DB) return json({ error: 'DATABASE_NOT_CONFIGURED' }, 503);
+      const jobId = url.pathname.slice('/v1/jobs/'.length);
+      if (!/^[0-9a-f-]{36}$/i.test(jobId)) return json({ error: 'INVALID_JOB_ID' }, 400);
+      const job = await getCrawlJob(env.DB, jobId);
+      return job ? json(job) : json({ error: 'JOB_NOT_FOUND' }, 404);
     }
 
-    let payload;
-    try {
-      const body = await request.text();
-      if (body.length > 4_096) return json({ error: 'REQUEST_TOO_LARGE' }, 413);
-      payload = JSON.parse(body);
-    } catch {
-      return json({ error: 'INVALID_JSON' }, 400);
+    if (request.method === 'GET' && url.pathname === '/v1/documents') {
+      if (!env.DB) return json({ error: 'DATABASE_NOT_CONFIGURED' }, 503);
+      const target = normalizePublicUrl(url.searchParams.get('url') || '');
+      if (!target) return json({ error: 'INVALID_URL' }, 400);
+      const document = await getDocument(env.DB, target);
+      return document ? json(document) : json({ error: 'DOCUMENT_NOT_FOUND' }, 404);
     }
 
-    if (!payload || typeof payload.url !== 'string' || payload.url.length > 2_048) {
-      return json({ error: 'INVALID_REQUEST', message: 'Provide one URL string in the url field.' }, 400);
+    if (request.method === 'POST' && url.pathname === '/v1/crawl/once') {
+      const parsed = await readJsonBody(request);
+      if (parsed.error) return json({ error: parsed.error }, parsed.error === 'REQUEST_TOO_LARGE' ? 413 : 400);
+      return crawlOnceResponse(parsed.payload);
     }
 
-    try {
-      const result = await crawlOne(payload.url);
-      const status = result.error
-        ? (result.error === 'ROBOTS_DISALLOWED' ? 403
-          : result.error === 'INVALID_URL' || result.error === 'INVALID_REDIRECT' ? 400
-            : result.error === 'UPSTREAM_HTTP_ERROR' ? 502 : 422)
-        : 200;
+    if (request.method === 'POST' && url.pathname === '/v1/crawl') {
+      if (!env.DB || !env.CRAWL_QUEUE) {
+        return json({
+          error: 'ASYNC_CRAWL_NOT_CONFIGURED',
+          message: 'Bind the D1 database as DB and the Cloudflare Queue as CRAWL_QUEUE before using asynchronous crawling.',
+        }, 503);
+      }
 
-      return json(result, status);
-    } catch (error) {
-      return json({
-        error: 'CRAWL_FAILED',
-        message: error instanceof Error ? error.message : 'Unexpected crawler error.',
-      }, 502);
+      const parsed = await readJsonBody(request);
+      if (parsed.error) return json({ error: parsed.error }, parsed.error === 'REQUEST_TOO_LARGE' ? 413 : 400);
+      const checked = requestUrl(parsed.payload);
+      if (checked.error) return json({ error: checked.error, message: checked.message }, 400);
+
+      const jobId = crypto.randomUUID();
+      const now = new Date().toISOString();
+      try {
+        await insertCrawlJob(env.DB, { id: jobId, url: checked.url, now });
+        await env.CRAWL_QUEUE.send({ jobId, url: checked.url });
+      } catch (error) {
+        try {
+          await updateCrawlJob(env.DB, jobId, {
+            status: 'failed',
+            updated_at: new Date().toISOString(),
+            finished_at: new Date().toISOString(),
+            error_code: 'QUEUE_ENQUEUE_FAILED',
+            error_message: error instanceof Error ? error.message.slice(0, 500) : 'Unable to enqueue crawl job.',
+          });
+        } catch {
+          // Preserve the original enqueue failure response.
+        }
+        return json({ error: 'QUEUE_ENQUEUE_FAILED' }, 503);
+      }
+
+      return json({ jobId, url: checked.url, status: 'queued', createdAt: now }, 202);
+    }
+
+    return json({ error: 'NOT_FOUND' }, 404);
+  },
+
+  async queue(batch, env) {
+    if (!env.DB) {
+      for (const message of batch.messages) message.retry({ delaySeconds: 60 });
+      return;
+    }
+
+    for (const message of batch.messages) {
+      await handleQueueMessage(message, env);
     }
   },
 };
