@@ -25,7 +25,7 @@ function directiveSet(...values) {
       const separator = entry.indexOf(':');
       const directiveText = separator >= 0 ? entry.slice(separator + 1) : entry;
 
-      for (const token of directiveText.split(/\\s+/)) {
+      for (const token of directiveText.split(/\s+/)) {
         const directive = token.trim();
         if (directive) directives.add(directive);
       }
