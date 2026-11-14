@@ -124,6 +124,50 @@ Queue delivery is at-least-once. Duplicate messages are acknowledged when their 
 
 This is a bounded same-origin crawler with a D1 FTS5 document index. The index is queried by the separate rewide Pages search API; the crawler itself does not expose a public search endpoint. It does not crawl external domains, execute JavaScript, render browser-only pages, or provide sitemap-driven discovery.
 
+## Tranco initial seed import
+
+The Tranco seed importer gives the crawler an initial set of domains instead of waiting for users to search URLs that are not indexed yet. It retrieves the latest daily Tranco list metadata, downloads only the requested prefix, and submits each domain's HTTPS root URL to the existing `POST /v1/crawl` endpoint.
+
+The default is deliberately bounded:
+
+- The default prefix is the top 100 domains; the allowed range is 1–500.
+- Each domain is submitted once, sequentially, with a 1,000 ms delay between submissions.
+- The default crawl limit is one page at depth 0. Use `--max-pages` and `--max-depth` to permit more same-origin pages.
+- The Worker remains responsible for URL validation, robots.txt, same-origin link scope, deduplication, and the 24-hour TTL decision.
+- The Tranco list ID and per-domain submission outcomes are saved to an audit JSON file under `data/tranco-seed-runs/`. The `data/` directory is ignored by Git.
+
+First preview the current top 100 without sending any Worker requests:
+
+```sh
+npm run seed:tranco -- --limit 100
+```
+
+Only add `--submit` when the preview is correct. In PowerShell, provide the Worker secret without typing it into the command history:
+
+```powershell
+$secureToken = Read-Host "DUMMYNET_TOKEN" -AsSecureString
+$ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+try {
+    $env:DUMMYNET_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+    npm run seed:tranco -- --submit --limit 100
+}
+finally {
+    $env:DUMMYNET_TOKEN = $null
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+    $secureToken.Dispose()
+}
+```
+
+To crawl up to five same-origin pages per domain, with one link level:
+
+```sh
+npm run seed:tranco -- --submit --limit 100 --max-pages 5 --max-depth 1
+```
+
+The importer stops after an authentication or configuration failure (HTTP 401, 403, or 503). A run report records `fresh`, `queued`, `deduplicated`, `failed`, and not-submitted counts. It never writes the Worker secret to the report.
+
+Tranco publishes a daily ranking and provides permanent list IDs for reproducibility. The importer records the selected list ID and source URL rather than committing the ranking file to this repository. See [Tranco](https://tranco-list.eu/) and its [API documentation](https://tranco-list.eu/api_documentation). Tranco aggregates rankings from external providers; consult its attribution and provider-license notes before redistributing any list data.
+
 ## Local development
 
 Requirements: Node.js 22.19+ and npm.
