@@ -1,5 +1,5 @@
 import { createRobotsPolicy } from './robots.js';
-import { insertCrawlJob, getCrawlJob, updateCrawlJob, insertCrawlPage, getCrawlPage, getCrawlPages, updateCrawlPage, saveDocumentAndCompletePage, failCrawlPage, finalizeCrawlJobIfIdle, getDocument } from './job-store.js';
+import { insertCrawlJob, getCrawlJob, getActiveCrawlJob, updateCrawlJob, insertCrawlPage, getCrawlPage, getCrawlPages, updateCrawlPage, saveDocumentAndCompletePage, completeCrawlPageAsSkipped, failCrawlPage, finalizeCrawlJobIfIdle, getDocument, watchTTL, WATCH_TTL_MS } from './job-store.js';
 import { selectCrawlLinks } from './frontier.js';
 
 const USER_AGENT = 'rewidebot/0.1';
@@ -460,6 +460,14 @@ async function handleQueueMessage(message, env) {
       return;
     }
 
+    const freshness = await watchTTL(env.DB, pageUrl);
+    if (freshness.isFresh) {
+      await completeCrawlPageAsSkipped(env.DB, body.jobId, pageUrl);
+      await finalizeCrawlJobIfIdle(env.DB, body.jobId);
+      message.ack();
+      return;
+    }
+
     await updateCrawlPage(env.DB, body.jobId, pageUrl, {
       status: 'running',
       attempts: message.attempts,
@@ -577,12 +585,18 @@ export default {
         bot: USER_AGENT,
         status: 'ok',
         runtime: 'cloudflare-workers',
-        version: '0.3.0',
+        version: '0.4.0',
+        crawlPolicy: {
+          trigger: 'user-request',
+          watchTTLSeconds: WATCH_TTL_MS / 1000,
+        },
         capabilities: {
           queue: Boolean(env.CRAWL_QUEUE),
           database: Boolean(env.DB),
           asyncCrawl: Boolean(env.CRAWL_QUEUE && env.DB),
           recursiveCrawl: true,
+          requestTriggeredCrawling: true,
+          watchTTL: Boolean(env.DB),
         },
       });
     }
@@ -645,6 +659,42 @@ export default {
       const checked = requestUrl(parsed.payload);
       if (checked.error) return json({ error: checked.error, message: checked.message }, 400);
 
+      let freshness;
+      let activeJob;
+      try {
+        freshness = await watchTTL(env.DB, checked.url);
+        if (freshness.isFresh) {
+          return json({
+            url: checked.url,
+            status: 'fresh',
+            cached: true,
+            crawlRequired: false,
+            fetchedAt: freshness.fetchedAt,
+            ttlExpiresAt: freshness.expiresAt,
+          }, 200);
+        }
+        activeJob = await getActiveCrawlJob(env.DB, checked.url);
+      } catch {
+        return json({
+          error: 'WATCH_TTL_FAILED',
+          message: 'Unable to check the URL crawl history in D1.',
+        }, 503);
+      }
+
+      if (activeJob) {
+        return json({
+          jobId: activeJob.id,
+          url: checked.url,
+          status: activeJob.status,
+          createdAt: activeJob.created_at,
+          crawlRequired: false,
+          deduplicated: true,
+          maxPages: activeJob.max_pages,
+          maxDepth: activeJob.max_depth,
+          scope: 'same-origin',
+        }, 202);
+      }
+
       const requestedMaxPages = parsed.payload?.maxPages ?? 1;
       const requestedMaxDepth = parsed.payload?.maxDepth ?? (requestedMaxPages > 1 ? 2 : 0);
       if (
@@ -664,13 +714,31 @@ export default {
       const jobId = crypto.randomUUID();
       const now = new Date().toISOString();
       try {
-        await insertCrawlJob(env.DB, {
-          id: jobId,
-          url: checked.url,
-          maxPages: requestedMaxPages,
-          maxDepth: requestedMaxDepth,
-          now,
-        });
+        try {
+          await insertCrawlJob(env.DB, {
+            id: jobId,
+            url: checked.url,
+            maxPages: requestedMaxPages,
+            maxDepth: requestedMaxDepth,
+            now,
+          });
+        } catch (error) {
+          const concurrentJob = await getActiveCrawlJob(env.DB, checked.url).catch(() => null);
+          if (concurrentJob) {
+            return json({
+              jobId: concurrentJob.id,
+              url: checked.url,
+              status: concurrentJob.status,
+              createdAt: concurrentJob.created_at,
+              crawlRequired: false,
+              deduplicated: true,
+              maxPages: concurrentJob.max_pages,
+              maxDepth: concurrentJob.max_depth,
+              scope: 'same-origin',
+            }, 202);
+          }
+          throw error;
+        }
         await insertCrawlPage(env.DB, {
           jobId,
           url: checked.url,
