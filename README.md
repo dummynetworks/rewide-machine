@@ -17,6 +17,14 @@ The production entry point is `src/worker.js`, configured by `wrangler.jsonc`.
 
 ### Submit a crawl
 
+Crawling is user-triggered, not scheduled. Every `POST /v1/crawl` request passes through the D1-backed `watchTTL` check before a job is created:
+
+- A document fetched less than 24 hours ago is reused. The endpoint returns `200` with `status: "fresh"` and does not enqueue a crawl.
+- A missing document or a document at least 24 hours old is eligible for crawling.
+- If the same URL already has a queued or running root job, the endpoint returns that job instead of creating a duplicate.
+- The Queue consumer checks `watchTTL` again for every URL in the recursive frontier. This prevents a queued URL from being fetched if another crawl made it fresh while it was waiting.
+- The TTL is measured from the successful document `fetched_at` timestamp. Failed crawls do not refresh it, and the previous document remains available.
+
 A normal request remains a single-page crawl:
 
 ```http
@@ -94,6 +102,7 @@ Migrations:
 - `0001_initial.sql` creates `crawl_jobs` and `documents`.
 - `0002_recursive_crawl.sql` adds crawl limits and page counters to `crawl_jobs`, and creates the per-job `crawl_pages` frontier.
 - `0003_documents_fts.sql` creates a SQLite FTS5 full-text index over document titles, descriptions, and extracted text. Triggers keep it synchronized with document inserts, updates, and deletes; the migration rebuilds the index from documents already stored.
+- `0004_on_demand_ttl.sql` adds per-job skipped-page accounting and enforces one active root crawl job per normalized URL.
 
 After the Queue exists and migrations have been applied, deploy the Worker. Wrangler configures the producer binding `CRAWL_QUEUE` and the consumer for `rewide-crawl-queue` from `wrangler.jsonc`.
 
@@ -108,7 +117,7 @@ Until the Queue binding and D1 tables are available, `GET /health` reports missi
 3. It publishes the starting page as a Cloudflare Queue message.
 4. The Queue consumer fetches and extracts one page, then discovers eligible same-origin links up to the configured depth and page limit.
 5. Per-job URL uniqueness prevents repeated frontier entries. Each newly discovered page is inserted into D1 before it is published to the Queue.
-6. The consumer stores each document and marks the corresponding frontier page complete in a D1 batch. Temporary failures are retried; terminal page failures are recorded and do not stop other pages.
+6. The consumer checks each frontier URL against the 24-hour D1 `watchTTL` before fetching. Fresh URLs are marked completed with `skip_reason: "fresh-within-watch-ttl"`; stale or unseen URLs are fetched. The consumer stores each fetched document and marks the corresponding frontier page complete in a D1 batch. Temporary failures are retried; terminal page failures are recorded and do not stop other pages.
 7. The job becomes terminal when no frontier pages remain queued or running. Read its aggregate status from `GET /v1/jobs/:jobId` and page-level results from `GET /v1/jobs/:jobId/pages`.
 
 Queue delivery is at-least-once. Duplicate messages are acknowledged when their frontier page is already terminal; document writes are URL-keyed upserts. If publishing a discovered child fails after its frontier row was inserted, retrying the parent can publish that still-queued child again.
