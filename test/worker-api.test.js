@@ -7,6 +7,7 @@ const TOKEN = 'test-token-that-is-long-enough-for-worker-auth';
 function createDb() {
   const jobs = new Map();
   const pages = new Map();
+  const documents = new Map();
   const pageKey = (jobId, url) => `${jobId}:${url}`;
 
   function makeStatement(sql, values = []) {
@@ -23,7 +24,7 @@ function createDb() {
             id, url, status: 'queued', attempts: 0,
             created_at: createdAt, updated_at: updatedAt,
             max_pages: maxPages, max_depth: maxDepth,
-            pages_crawled: 0, pages_failed: 0,
+            pages_crawled: 0, pages_failed: 0, pages_skipped: 0,
           });
           changes = 1;
         } else if (sql.includes('INSERT OR IGNORE INTO crawl_pages')) {
@@ -60,6 +61,12 @@ function createDb() {
         return { meta: { changes } };
       },
       async first() {
+        if (sql.includes('FROM documents')) return documents.get(values[0]) || null;
+        if (sql.includes('FROM crawl_jobs') && sql.includes('url = ?')) {
+          return [...jobs.values()].find((job) => (
+            job.url === values[0] && ['queued', 'running'].includes(job.status)
+          )) || null;
+        }
         if (sql.includes('FROM crawl_jobs')) return jobs.get(values[0]) || null;
         if (sql.includes('FROM crawl_pages')) return pages.get(pageKey(values[0], values[1])) || null;
         return null;
@@ -75,6 +82,7 @@ function createDb() {
   return {
     jobs,
     pages,
+    documents,
     prepare: (sql) => makeStatement(sql),
     async batch(statements) {
       for (const statement of statements) await statement.run();
@@ -118,6 +126,65 @@ test('POST /v1/crawl persists a root page and publishes a queue message', async 
     depth: 0,
     parentUrl: null,
   }]);
+});
+
+test('POST /v1/crawl returns a fresh document without enqueueing another crawl', async () => {
+  const DB = createDb();
+  const sent = [];
+  const url = 'https://example.com/';
+  DB.documents.set(url, {
+    url,
+    fetchedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    httpStatus: 200,
+    contentType: 'text/html',
+    title: 'Cached Example',
+    description: '',
+    canonicalUrl: null,
+    language: 'en',
+    text: 'cached',
+    linksJson: '[]',
+    noIndex: 0,
+    noFollow: 0,
+    indexable: 1,
+    updatedAt: new Date().toISOString(),
+  });
+  const CRAWL_QUEUE = { async send(body) { sent.push(body); } };
+
+  const response = await submitCrawl({ DB, CRAWL_QUEUE, payload: { url } });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.status, 'fresh');
+  assert.equal(body.cached, true);
+  assert.equal(body.crawlRequired, false);
+  assert.equal(DB.jobs.size, 0);
+  assert.deepEqual(sent, []);
+});
+
+test('POST /v1/crawl reuses an already active job for the same URL', async () => {
+  const DB = createDb();
+  const sent = [];
+  const activeJob = {
+    id: '00000000-0000-4000-8000-000000000001',
+    url: 'https://example.com/',
+    status: 'running',
+    created_at: new Date().toISOString(),
+    max_pages: 10,
+    max_depth: 1,
+  };
+  DB.jobs.set(activeJob.id, activeJob);
+  const CRAWL_QUEUE = { async send(body) { sent.push(body); } };
+
+  const response = await submitCrawl({
+    DB, CRAWL_QUEUE, payload: { url: activeJob.url },
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 202);
+  assert.equal(body.jobId, activeJob.id);
+  assert.equal(body.deduplicated, true);
+  assert.equal(DB.jobs.size, 1);
+  assert.deepEqual(sent, []);
 });
 
 test('POST /v1/crawl accepts bounded recursive crawl limits', async () => {
