@@ -13,8 +13,9 @@
     "deploy": "wrangler deploy",
     "deploy:dry-run": "wrangler deploy --dry-run --outdir=.wrangler/deploy",
     "crawl": "node src/cli.js",
+    "seed:tranco": "node src/seed-tranco.js",
     "test": "node --test",
-    "check": "node --check src/cli.js && node --check src/crawler.js && node --check src/extract.js && node --check src/frontier.js && node --check src/robots.js && node --check src/store.js && node --check src/transport.js && node --check src/url.js && node --check src/worker.js && node --check src/job-store.js"
+    "check": "node --check src/cli.js && node --check src/crawler.js && node --check src/extract.js && node --check src/frontier.js && node --check src/robots.js && node --check src/store.js && node --check src/transport.js && node --check src/url.js && node --check src/tranco-seed.js && node --check src/seed-tranco.js && node --check src/worker.js && node --check src/job-store.js"
   },
   "dependencies": {
     "cheerio": "1.2.0",
