@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import {
   insertCrawlJob,
   getCrawlJob,
+  getActiveCrawlJob,
+  watchTTL,
+  WATCH_TTL_MS,
   updateCrawlJob,
   insertCrawlPage,
   getCrawlPage,
@@ -109,6 +112,11 @@ function createFakeDb() {
             completed: pages.filter((page) => page.status === 'completed').length,
           };
         }
+        if (sql.includes('FROM crawl_jobs') && sql.includes('url = ?')) {
+          return [...state.jobs.values()].find((job) => (
+            job.url === values[0] && ['queued', 'running'].includes(job.status)
+          )) || null;
+        }
         if (sql.includes('FROM crawl_jobs')) return state.jobs.get(values[0]) || null;
         if (sql.includes('FROM crawl_pages')) return state.pages.get(pageKey(values[0], values[1])) || null;
         if (sql.includes('FROM documents')) return state.documents.get(values[0]) || null;
@@ -167,6 +175,43 @@ test('insert and retrieve a queued crawl job', async () => {
   assert.equal(job.status, 'queued');
   assert.equal((await getCrawlJob(db, 'job-1')).url, 'https://example.com/');
   assert.equal((await getCrawlJob(db, 'job-1')).max_pages, 4);
+});
+
+test('watchTTL treats missing documents and documents at least 24 hours old as stale', async () => {
+  const db = createFakeDb();
+  const now = Date.parse('2026-11-14T12:00:00.000Z');
+  const makeDocument = (fetchedAt) => ({
+    url: 'https://example.com/',
+    fetchedAt,
+    httpStatus: 200,
+    contentType: 'text/html',
+    title: 'Example',
+    description: '',
+    canonicalUrl: null,
+    language: 'en',
+    text: 'Example body',
+    linksJson: '[]',
+    noIndex: 0,
+    noFollow: 0,
+    indexable: 1,
+    updatedAt: fetchedAt,
+  });
+
+  assert.equal((await watchTTL(db, 'https://example.com/', { now })).isFresh, false);
+  db.state.documents.set('https://example.com/', makeDocument(
+    new Date(now - WATCH_TTL_MS + 1).toISOString(),
+  ));
+  assert.equal((await watchTTL(db, 'https://example.com/', { now })).isFresh, true);
+  db.state.documents.set('https://example.com/', makeDocument(
+    new Date(now - WATCH_TTL_MS).toISOString(),
+  ));
+  assert.equal((await watchTTL(db, 'https://example.com/', { now })).isFresh, false);
+});
+
+test('finds an already active root crawl by URL', async () => {
+  const db = createFakeDb();
+  await insertCrawlJob(db, { id: 'active-job', url: 'https://example.com/' });
+  assert.equal((await getActiveCrawlJob(db, 'https://example.com/')).id, 'active-job');
 });
 
 test('rejects unsupported job update fields', async () => {
