@@ -1,12 +1,12 @@
 const JOB_COLUMNS = `
   id, url, status, attempts, created_at, updated_at, finished_at,
   document_url, error_code, error_message, max_pages, max_depth,
-  pages_crawled, pages_failed
+  pages_crawled, pages_failed, pages_skipped
 `;
 
 const PAGE_COLUMNS = `
   job_id, url, depth, status, attempts, parent_url, created_at,
-  updated_at, finished_at, error_code, error_message
+  updated_at, finished_at, error_code, error_message, skip_reason
 `;
 
 export async function insertCrawlJob(db, {
@@ -40,6 +40,16 @@ export async function getCrawlJob(db, id) {
   return db.prepare(`
     SELECT ${JOB_COLUMNS} FROM crawl_jobs WHERE id = ? LIMIT 1
   `).bind(id).first();
+}
+
+export async function getActiveCrawlJob(db, url) {
+  return db.prepare(`
+    SELECT ${JOB_COLUMNS}
+    FROM crawl_jobs
+    WHERE url = ? AND status IN ('queued', 'running')
+    ORDER BY created_at ASC
+    LIMIT 1
+  `).bind(url).first();
 }
 
 export async function updateCrawlJob(db, id, fields) {
@@ -119,7 +129,7 @@ export async function updateCrawlPage(db, jobId, url, fields) {
   const values = [];
 
   for (const [key, value] of Object.entries(fields)) {
-    if (!['status', 'attempts', 'updated_at', 'finished_at', 'error_code', 'error_message'].includes(key)) {
+    if (!['status', 'attempts', 'updated_at', 'finished_at', 'error_code', 'error_message', 'skip_reason'].includes(key)) {
       throw new TypeError(`Unsupported crawl page field: ${key}`);
     }
     assignments.push(`${key} = ?`);
@@ -183,6 +193,7 @@ export async function saveDocumentAndCompletePage(
     SET status = 'completed',
         updated_at = ?,
         finished_at = ?,
+        skip_reason = NULL,
         error_code = NULL,
         error_message = NULL
     WHERE job_id = ? AND url = ?
@@ -197,6 +208,35 @@ export async function saveDocumentAndCompletePage(
   `).bind(now, jobId);
 
   await db.batch([documentStatement, pageStatement, jobStatement]);
+}
+
+export async function completeCrawlPageAsSkipped(
+  db,
+  jobId,
+  pageUrl,
+  reason = 'fresh-within-watch-ttl',
+  now = new Date().toISOString(),
+) {
+  const pageStatement = db.prepare(`
+    UPDATE crawl_pages
+    SET status = 'completed',
+        updated_at = ?,
+        finished_at = ?,
+        skip_reason = ?,
+        error_code = NULL,
+        error_message = NULL
+    WHERE job_id = ? AND url = ?
+  `).bind(now, now, reason, jobId, pageUrl);
+
+  const jobStatement = db.prepare(`
+    UPDATE crawl_jobs
+    SET pages_skipped = pages_skipped + 1,
+        status = 'running',
+        updated_at = ?
+    WHERE id = ?
+  `).bind(now, jobId);
+
+  await db.batch([pageStatement, jobStatement]);
 }
 
 export async function failCrawlPage(db, jobId, url, {
@@ -299,6 +339,35 @@ export async function saveDocumentAndCompleteJob(db, jobId, document, now = new 
   `).bind(now, now, document.url, jobId);
 
   await db.batch([documentStatement, jobStatement]);
+}
+
+export const WATCH_TTL_MS = 24 * 60 * 60 * 1000;
+
+export async function watchTTL(db, url, {
+  now = Date.now(),
+  ttlMs = WATCH_TTL_MS,
+} = {}) {
+  const document = await getDocument(db, url);
+  const fetchedAtMs = Date.parse(document?.fetchedAt ?? '');
+
+  if (!document || !Number.isFinite(fetchedAtMs)) {
+    return {
+      isFresh: false,
+      document: document ?? null,
+      fetchedAt: document?.fetchedAt ?? null,
+      ageMs: null,
+      expiresAt: null,
+    };
+  }
+
+  const ageMs = now - fetchedAtMs;
+  return {
+    isFresh: ageMs < ttlMs,
+    document,
+    fetchedAt: document.fetchedAt,
+    ageMs: Math.max(0, ageMs),
+    expiresAt: new Date(fetchedAtMs + ttlMs).toISOString(),
+  };
 }
 
 export async function getDocument(db, url) {
