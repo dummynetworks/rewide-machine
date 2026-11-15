@@ -29,6 +29,7 @@ function createDb() {
             id, url, status: 'queued', attempts: 0,
             created_at: createdAt, updated_at: updatedAt,
             max_pages: maxPages, max_depth: maxDepth,
+            scope_origin: new URL(url).origin,
             pages_crawled: 0, pages_failed: 0, pages_skipped: 0,
           });
           changes = 1;
@@ -52,6 +53,7 @@ function createDb() {
             if (sql.includes('pages_crawled = pages_crawled + 1')) {
               job.pages_crawled += 1;
               job.updated_at = values[0];
+              if (values[1]) job.scope_origin = values[1];
             } else if (sql.includes('pages_failed = pages_failed + 1')) {
               job.pages_failed += 1;
               job.updated_at = values[0];
