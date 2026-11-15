@@ -492,16 +492,7 @@ export async function watchTTL(db, url, {
   now = Date.now(),
   ttlMs = WATCH_TTL_MS,
 } = {}) {
-  let document = await getDocument(db, url);
-  if (!document) {
-    const discovery = await db.prepare(`
-      SELECT resolved_url AS resolvedUrl
-      FROM discovered_urls
-      WHERE url = ? AND resolved_url IS NOT NULL
-      LIMIT 1
-    `).bind(url).first();
-    if (discovery?.resolvedUrl) document = await getDocument(db, discovery.resolvedUrl);
-  }
+  const document = await getDocument(db, url);
   const fetchedAtMs = Date.parse(document?.fetchedAt ?? '');
 
   if (!document || !Number.isFinite(fetchedAtMs)) {
@@ -533,7 +524,18 @@ export async function getDocument(db, url) {
     FROM documents WHERE url = ? LIMIT 1
   `).bind(url).first();
 
-  if (!row) return null;
+  if (!row) {
+    const discovery = await db.prepare(`
+      SELECT resolved_url AS resolvedUrl
+      FROM discovered_urls
+      WHERE url = ? AND resolved_url IS NOT NULL
+      LIMIT 1
+    `).bind(url).first();
+    if (discovery?.resolvedUrl && discovery.resolvedUrl !== url) {
+      return getDocument(db, discovery.resolvedUrl);
+    }
+    return null;
+  }
   let links = [];
   try {
     links = JSON.parse(row.linksJson || '[]');
