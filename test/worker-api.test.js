@@ -46,6 +46,17 @@ function createDb() {
             });
             changes = 1;
           }
+        } else if (sql.includes('UPDATE crawl_pages')) {
+          const jobId = values.at(-2);
+          const pageUrl = values.at(-1);
+          const page = pages.get(pageKey(jobId, pageUrl));
+          if (page) {
+            if (sql.includes("SET status = 'completed'")) page.status = 'completed';
+            if (sql.includes("SET status = 'failed'")) page.status = 'failed';
+            const fields = [...sql.matchAll(/([a-z_]+) = \\?/g)].map((match) => match[1]);
+            fields.forEach((field, index) => { page[field] = values[index]; });
+            changes = 1;
+          }
         } else if (sql.includes('UPDATE crawl_jobs')) {
           const id = values.at(-1);
           const job = jobs.get(id);
