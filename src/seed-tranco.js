@@ -141,7 +141,12 @@ export async function classifyWorkerResponse(response) {
     };
   }
 
-  if (response.status === 202 && isObject(payload) && typeof payload.jobId === 'string') {
+  if (
+    response.status === 202
+    && isObject(payload)
+    && ['queued', 'running'].includes(payload.status)
+    && typeof payload.jobId === 'string'
+  ) {
     return {
       status: payload.deduplicated === true ? 'deduplicated' : 'queued',
       httpStatus: response.status,
@@ -268,6 +273,8 @@ async function main() {
         '[' + (index + 1) + '/' + list.entries.length + '] #' + entry.rank + ' ' + entry.domain
         + ': failed (' + message + ')',
       );
+      summary.notSubmitted = list.entries.length - index - 1;
+      break;
     }
   }
 
@@ -300,7 +307,7 @@ async function main() {
   console.log(JSON.stringify(summary, null, 2));
   console.log('Audit report: ' + outputPath);
 
-  if (summary.failed > 0) process.exitCode = 1;
+  if (summary.failed > 0 || summary.rejected > 0) process.exitCode = 1;
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : '';
