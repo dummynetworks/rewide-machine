@@ -94,6 +94,40 @@ function sleep(ms) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
+export async function classifyWorkerResponse(response) {
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    // Preserve the HTTP status when the upstream response is not JSON.
+  }
+
+  if (response.status === 200 && payload?.status === 'fresh') {
+    return { status: 'fresh', httpStatus: response.status, fetchedAt: payload.fetchedAt || null };
+  }
+  if (response.status === 200 && payload?.status === 'cooldown') {
+    return {
+      status: 'cooldown',
+      httpStatus: response.status,
+      retryAt: payload.retryAt || null,
+      previousFailureAt: payload.previousFailureAt || null,
+    };
+  }
+  if (response.status === 202) {
+    return {
+      status: payload?.deduplicated === true ? 'deduplicated' : 'queued',
+      httpStatus: response.status,
+      jobId: payload?.jobId || null,
+    };
+  }
+
+  return {
+    status: 'failed',
+    httpStatus: response.status,
+    error: payload?.error || payload?.message || 'Unexpected Worker response.',
+  };
+}
+
 async function submitSeed(entry, options, token) {
   const response = await fetch(options.endpoint, {
     method: 'POST',
@@ -110,29 +144,7 @@ async function submitSeed(entry, options, token) {
     signal: AbortSignal.timeout(15_000),
   });
 
-  let payload = null;
-  try {
-    payload = await response.json();
-  } catch {
-    // Preserve the HTTP status when the upstream response is not JSON.
-  }
-
-  if (response.status === 200 && payload?.status === 'fresh') {
-    return { status: 'fresh', httpStatus: response.status, fetchedAt: payload.fetchedAt || null };
-  }
-  if (response.status === 202) {
-    return {
-      status: payload?.deduplicated === true ? 'deduplicated' : 'queued',
-      httpStatus: response.status,
-      jobId: payload?.jobId || null,
-    };
-  }
-
-  return {
-    status: 'failed',
-    httpStatus: response.status,
-    error: payload?.error || payload?.message || 'Unexpected Worker response.',
-  };
+  return classifyWorkerResponse(response);
 }
 
 async function writeReport(report, outputPath) {
@@ -174,6 +186,7 @@ async function main() {
     fresh: 0,
     queued: 0,
     deduplicated: 0,
+    cooldown: 0,
     failed: 0,
     notSubmitted: 0,
   };
