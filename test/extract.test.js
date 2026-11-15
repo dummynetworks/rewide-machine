@@ -63,3 +63,43 @@ test('extracts sitemap page URLs and nested sitemap URLs', () => {
   assert.deepEqual(result.pages, []);
   assert.deepEqual(result.sitemaps, ['https://example.com/nested.xml']);
 });
+
+
+test('excludes related and recommendation modules from indexed body text', () => {
+  const html = `<!doctype html>
+    <html lang="en">
+      <head><title>Water service profile</title></head>
+      <body>
+        <main>
+          <article>
+            <h1>Water service profile</h1>
+            <p>The provider manages bulk water services for the province.</p>
+          </article>
+          <section class="related-articles">
+            <h2>From Xhosa Roots to Paris Runway Prestige</h2>
+            <p>MiningInsights CVMR Builds Africa's Mineral Value Chain</p>
+          </section>
+          <div id="recommended-content">
+            <p>HCLTech Expands Climate</p>
+          </div>
+          <div role="complementary">
+            <p>Popular stories and other site navigation.</p>
+          </div>
+        </main>
+      </body>
+    </html>`;
+
+  const document = extractDocument(
+    html,
+    'https://example.com/water-profile',
+    new Headers(),
+    { maxTextLength: 1000 },
+  );
+
+  assert.match(document.text, /Water service profile/);
+  assert.match(document.text, /bulk water services/);
+  assert.doesNotMatch(
+    document.text,
+    /Paris Runway Prestige|MiningInsights|HCLTech Expands Climate|Popular stories/,
+  );
+});
