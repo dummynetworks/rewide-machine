@@ -31,11 +31,13 @@ Seeder result: `fresh`. No new crawl is required.
   "cached": false,
   "crawlRequired": false,
   "retryAt": "2026-11-16T00:00:00.000Z",
-  "previousFailureAt": "2026-11-15T00:00:00.000Z"
+  "previousFailureAt": "2026-11-15T00:00:00.000Z",
+  "errorCode": "ROBOTS_DISALLOWED",
+  "upstreamHttpStatus": null
 }
 ```
 
-Seeder result: `cooldown`. This is a retry deferral, not a failed submission.
+Seeder result: `cooldown`. This is a retry deferral, not a failed submission. The optional error metadata identifies the failed root page's reason and upstream HTTP status when one exists. Retry timing is selected by failure category, and a parsed upstream `Retry-After` value is honored up to seven days.
 
 ### 202 — newly queued crawl
 
