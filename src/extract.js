@@ -1,21 +1,6 @@
 import * as cheerio from 'cheerio';
 import { normalizeUrl } from './url.js';
-
-const REMOVE_SELECTORS = [
-  'script',
-  'style',
-  'noscript',
-  'template',
-  'svg',
-  'canvas',
-  'iframe',
-  'nav',
-  'footer',
-  'form',
-  'aside',
-  '[hidden]',
-  '[aria-hidden="true"]',
-];
+import { REMOVE_CONTENT_SELECTORS } from './content-selectors.js';
 
 function directiveSet(...values) {
   const directives = new Set();
@@ -70,7 +55,7 @@ export function extractDocument(input, pageUrl, headers = new Headers(), options
   const noIndex = directives.has('noindex') || directives.has('none');
   const noFollow = directives.has('nofollow') || directives.has('none');
 
-  for (const selector of REMOVE_SELECTORS) $(selector).remove();
+  for (const selector of REMOVE_CONTENT_SELECTORS) $(selector).remove();
 
   const text = ($('body').text() || $.root().text())
     .replace(/[\t\n\r ]+/g, ' ')
