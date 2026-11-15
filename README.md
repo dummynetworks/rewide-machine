@@ -22,7 +22,7 @@ Crawling is user-triggered, not scheduled. Every `POST /v1/crawl` request passes
 - A document fetched less than 24 hours ago is reused. The endpoint returns `200` with `status: "fresh"` and does not enqueue a crawl.
 - A missing document or a document at least 24 hours old is eligible for crawling.
 - If the same URL already has a queued or running root job, the endpoint returns that job instead of creating a duplicate.
-- A URL whose most recent crawl job failed is held in a separate 24-hour retry cooldown. This does not refresh the document's success TTL; an older successful document remains available while a retry is deferred.
+- A URL whose most recent crawl job failed is held by a reason-specific retry delay. Robots denials and out-of-scope redirects are rechecked after 24 hours; transient upstream failures (408, 425, and 5xx) are retried after 15 minutes; 429 responses use a one-hour minimum and honor a longer upstream `Retry-After`; other upstream 4xx responses are retried after 6 hours. Temporary Worker retry exhaustion uses 15 minutes, and unknown failures use one hour. These delays never refresh the successful-document TTL.
 - The Queue consumer checks `watchTTL` again for every URL in the recursive frontier. This prevents a queued URL from being fetched if another crawl made it fresh while it was waiting.
 - The TTL is measured from the successful document `fetched_at` timestamp. Failed crawls do not refresh it, and the previous document remains available.
 
@@ -48,10 +48,10 @@ To follow links on the same origin, set bounded crawl limits:
 
 - `maxPages`: total page limit including the starting URL; integer from 1 to 50. Defaults to 1.
 - `maxDepth`: maximum link distance from the starting URL; integer from 0 to 5. Defaults to 0 for a single-page crawl and 2 when `maxPages` is greater than 1.
-- Scope is same-origin only. Links to other hosts are not added to the frontier.
+- Recursive links stay on the final root Origin. The root request may follow HTTP→HTTPS and apex↔www redirects (for example, `example.com` ↔ `www.example.com`); HTTPS is never downgraded to HTTP. Other cross-origin redirects remain blocked. Links to other hosts are recorded as discoveries but are not added to the crawl frontier.
 - URL fragments are removed before deduplication. Each normalized URL is added at most once per job.
 - Every fetched page is checked against that page origin's `robots.txt`. A robots denial is recorded as a page failure and does not stop other queued pages. The URL remains in the discovery index with `noindex_status = 'unknown'`; robots disallow is never treated as proof of `noindex`.
-- Per-page errors are visible in the pages endpoint. A crawl job completes when its frontier is drained and at least one page succeeded; it fails when no page succeeded.
+- Per-page errors are visible in the pages endpoint, including upstream HTTP status and any parsed `Retry-After` date. A crawl job completes when its frontier is drained and at least one page succeeded; it fails when no page succeeded.
 
 Example response:
 
@@ -105,6 +105,7 @@ Migrations:
 - `0003_documents_fts.sql` creates a SQLite FTS5 full-text index over document titles, descriptions, and extracted text. Triggers keep it synchronized with document inserts, updates, and deletes; the migration rebuilds the index from documents already stored.
 - `0004_on_demand_ttl.sql` adds per-job skipped-page accounting and enforces one active root crawl job per normalized URL.
 - `0005_discovered_urls.sql` stores discovered URLs separately from fetched documents and adds an FTS5 index for URL, title, description, and referring-link text. A blocked or failed crawl remains searchable as `UNKNOWN`; a fetched `noindex` page is excluded.
+- `0006_redirect_scope_retry_metadata.sql` stores the final root Origin and per-page upstream HTTP status / `Retry-After` metadata.
 
 After the Queue exists and migrations have been applied, deploy the Worker. Wrangler configures the producer binding `CRAWL_QUEUE` and the consumer for `rewide-crawl-queue` from `wrangler.jsonc`.
 
@@ -120,7 +121,7 @@ Until the Queue binding and D1 tables are available, `GET /health` reports missi
 4. The Queue consumer fetches and extracts one page, records its outgoing links as URL discoveries (including cross-origin references), then follows only eligible same-origin links up to the configured depth and page limit.
 5. Per-job URL uniqueness prevents repeated frontier entries. Each newly discovered page is inserted into D1 before it is published to the Queue.
 6. The consumer checks each frontier URL against the 24-hour D1 `watchTTL` before fetching. Fresh URLs are marked completed with `skip_reason: "fresh-within-watch-ttl"`; stale or unseen URLs are fetched. The consumer stores each fetched document and marks the corresponding frontier page complete in a D1 batch. Temporary failures are retried; terminal page failures are recorded and do not stop other pages.
-7. The job becomes terminal when no frontier pages remain queued or running. Read its aggregate status from `GET /v1/jobs/:jobId` and page-level results from `GET /v1/jobs/:jobId/pages`.
+7. The job becomes terminal when no frontier pages remain queued or running. Read its aggregate status from `GET /v1/jobs/:jobId` and page-level results (including upstream retry metadata) from `GET /v1/jobs/:jobId/pages`.
 
 Queue delivery is at-least-once. Duplicate messages are acknowledged when their frontier page is already terminal; document writes are URL-keyed upserts. If publishing a discovered child fails after its frontier row was inserted, retrying the parent can publish that still-queued child again.
 
