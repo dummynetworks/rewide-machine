@@ -94,6 +94,26 @@ function sleep(ms) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
+const WORKER_ERROR_RESPONSES = Object.freeze({
+  NOT_CONFIGURED: { status: 'failed', category: 'configuration', stopSubmission: true },
+  UNAUTHORIZED: { status: 'failed', category: 'authentication', stopSubmission: true },
+  ASYNC_CRAWL_NOT_CONFIGURED: { status: 'failed', category: 'configuration', stopSubmission: true },
+  INVALID_JSON: { status: 'failed', category: 'request', stopSubmission: true },
+  REQUEST_TOO_LARGE: { status: 'failed', category: 'request', stopSubmission: true },
+  INVALID_REQUEST: { status: 'failed', category: 'request', stopSubmission: true },
+  INVALID_URL: { status: 'rejected', category: 'url', stopSubmission: false },
+  DISCOVERY_RECORD_FAILED: { status: 'failed', category: 'storage', stopSubmission: true },
+  WATCH_TTL_FAILED: { status: 'failed', category: 'storage', stopSubmission: true },
+  INVALID_CRAWL_LIMITS: { status: 'failed', category: 'request', stopSubmission: true },
+  QUEUE_ENQUEUE_FAILED: { status: 'failed', category: 'queue', stopSubmission: true },
+  METHOD_NOT_ALLOWED: { status: 'failed', category: 'endpoint', stopSubmission: true },
+  NOT_FOUND: { status: 'failed', category: 'endpoint', stopSubmission: true },
+});
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 export async function classifyWorkerResponse(response) {
   let payload = null;
   try {
@@ -103,28 +123,57 @@ export async function classifyWorkerResponse(response) {
   }
 
   if (response.status === 200 && payload?.status === 'fresh') {
-    return { status: 'fresh', httpStatus: response.status, fetchedAt: payload.fetchedAt || null };
+    return {
+      status: 'fresh',
+      httpStatus: response.status,
+      fetchedAt: payload.fetchedAt || null,
+      workerResponse: payload,
+    };
   }
+
   if (response.status === 200 && payload?.status === 'cooldown') {
     return {
       status: 'cooldown',
       httpStatus: response.status,
       retryAt: payload.retryAt || null,
       previousFailureAt: payload.previousFailureAt || null,
-    };
-  }
-  if (response.status === 202) {
-    return {
-      status: payload?.deduplicated === true ? 'deduplicated' : 'queued',
-      httpStatus: response.status,
-      jobId: payload?.jobId || null,
+      workerResponse: payload,
     };
   }
 
-  return {
+  if (response.status === 202 && isObject(payload) && typeof payload.jobId === 'string') {
+    return {
+      status: payload.deduplicated === true ? 'deduplicated' : 'queued',
+      httpStatus: response.status,
+      jobId: payload.jobId,
+      workerResponse: payload,
+    };
+  }
+
+  const errorCode = isObject(payload) && typeof payload.error === 'string'
+    ? payload.error
+    : null;
+  const knownError = errorCode ? WORKER_ERROR_RESPONSES[errorCode] : null;
+  const unknownErrorMustStop = response.status >= 400;
+  const classification = knownError || {
     status: 'failed',
+    category: isObject(payload) ? 'unknown_worker_error' : 'invalid_worker_response',
+    stopSubmission: unknownErrorMustStop,
+  };
+
+  return {
+    status: classification.status,
     httpStatus: response.status,
-    error: payload?.error || payload?.message || 'Unexpected Worker response.',
+    category: classification.category,
+    error: errorCode || (isObject(payload) && typeof payload.message === 'string'
+      ? payload.message
+      : 'Unexpected Worker response.'),
+    errorCode,
+    errorMessage: isObject(payload) && typeof payload.message === 'string'
+      ? payload.message
+      : null,
+    stopSubmission: classification.stopSubmission,
+    workerResponse: payload,
   };
 }
 
@@ -187,6 +236,7 @@ async function main() {
     queued: 0,
     deduplicated: 0,
     cooldown: 0,
+    rejected: 0,
     failed: 0,
     notSubmitted: 0,
   };
@@ -206,7 +256,7 @@ async function main() {
         + (result.httpStatus ? ' (HTTP ' + result.httpStatus + ')' : ''),
       );
 
-      if ([401, 403, 503].includes(result.httpStatus)) {
+      if (result.stopSubmission === true) {
         summary.notSubmitted = list.entries.length - index - 1;
         break;
       }
