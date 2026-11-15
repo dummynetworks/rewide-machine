@@ -45,6 +45,7 @@ function createFakeDb() {
             id, url, status: 'queued', attempts: 0,
             created_at: createdAt, updated_at: updatedAt,
             max_pages: maxPages, max_depth: maxDepth,
+            scope_origin: new URL(url).origin,
             pages_crawled: 0, pages_failed: 0,
           });
           changes = 1;
@@ -78,6 +79,7 @@ function createFakeDb() {
             if (sql.includes('pages_crawled = pages_crawled + 1')) {
               job.pages_crawled += 1;
               job.updated_at = values[0];
+              if (values[1]) job.scope_origin = values[1];
             } else if (sql.includes('pages_failed = pages_failed + 1')) {
               job.pages_failed += 1;
               job.updated_at = values[0];
@@ -144,11 +146,19 @@ function createFakeDb() {
             completed: pages.filter((page) => page.status === 'completed').length,
           };
         }
-        if (sql.includes("status = 'failed'") && sql.includes('FROM crawl_jobs') && sql.includes('url = ?')) {
+        if (sql.includes('JOIN crawl_pages') && sql.includes("j.status = 'failed'") && sql.includes('j.url = ?')) {
           const job = [...state.jobs.values()]
             .filter((item) => item.url === values[0] && item.status === 'failed' && item.finished_at)
             .sort((left, right) => Date.parse(right.finished_at) - Date.parse(left.finished_at))[0];
-          return job ? { id: job.id, finishedAt: job.finished_at } : null;
+          if (!job) return null;
+          const page = state.pages.get(pageKey(job.id, job.url));
+          return {
+            id: job.id,
+            finishedAt: job.finished_at,
+            errorCode: page?.error_code ?? null,
+            upstreamHttpStatus: page?.upstream_http_status ?? null,
+            retryAfterAt: page?.retry_after_at ?? null,
+          };
         }
         if (sql.includes('FROM crawl_jobs') && sql.includes('url = ?')) {
           return [...state.jobs.values()].find((job) => (
@@ -158,6 +168,10 @@ function createFakeDb() {
         if (sql.includes('FROM crawl_jobs')) return state.jobs.get(values[0]) || null;
         if (sql.includes('FROM crawl_pages')) return state.pages.get(pageKey(values[0], values[1])) || null;
         if (sql.includes('FROM documents')) return state.documents.get(values[0]) || null;
+        if (sql.includes('FROM discovered_urls') && sql.includes('resolved_url AS resolvedUrl')) {
+          const record = state.discoveredUrls.get(values[0]);
+          return record?.resolvedUrl ? { resolvedUrl: record.resolvedUrl } : null;
+        }
         return null;
       },
       async all() {
@@ -239,6 +253,35 @@ test('insert and retrieve a queued crawl job', async () => {
   assert.equal((await getCrawlJob(db, 'job-1')).max_pages, 4);
 });
 
+test('watchTTL resolves a redirected root URL to its successfully stored final URL', async () => {
+  const db = createFakeDb();
+  const originalUrl = 'http://example.com/';
+  const finalUrl = 'https://www.example.com/';
+  db.state.discoveredUrls.set(originalUrl, { url: originalUrl, resolvedUrl: finalUrl });
+  db.state.documents.set(finalUrl, {
+    url: finalUrl,
+    fetchedAt: '2026-11-14T12:00:00.000Z',
+    httpStatus: 200,
+    contentType: 'text/html',
+    title: 'Example',
+    description: '',
+    canonicalUrl: null,
+    language: 'en',
+    text: 'Example body',
+    linksJson: '[]',
+    noIndex: 0,
+    noFollow: 0,
+    indexable: 1,
+    updatedAt: '2026-11-14T12:00:00.000Z',
+  });
+
+  const freshness = await watchTTL(db, originalUrl, {
+    now: Date.parse('2026-11-14T13:00:00.000Z'),
+  });
+  assert.equal(freshness.isFresh, true);
+  assert.equal(freshness.document.url, finalUrl);
+});
+
 test('watchTTL treats missing documents and documents at least 24 hours old as stale', async () => {
   const db = createFakeDb();
   const now = Date.parse('2026-11-14T12:00:00.000Z');
@@ -276,7 +319,7 @@ test('finds an already active root crawl by URL', async () => {
   assert.equal((await getActiveCrawlJob(db, 'https://example.com/')).id, 'active-job');
 });
 
-test('applies a 24-hour cooldown after failed crawls without changing the success TTL', async () => {
+test('uses a 24-hour robots cooldown without changing the successful document TTL', async () => {
   const db = createFakeDb();
   const url = 'https://blocked.example/';
   const failedAt = '2026-11-14T12:00:00.000Z';
@@ -286,11 +329,21 @@ test('applies a 24-hour cooldown after failed crawls without changing the succes
     status: 'failed',
     finished_at: failedAt,
   });
+  db.state.pages.set('failed-job:' + url, {
+    job_id: 'failed-job',
+    url,
+    depth: 0,
+    status: 'failed',
+    error_code: 'ROBOTS_DISALLOWED',
+    upstream_http_status: null,
+    retry_after_at: null,
+  });
 
   const justBeforeExpiry = await getRecentFailedCrawlJob(db, url, {
     now: Date.parse('2026-11-15T11:59:59.999Z'),
   });
   assert.equal(justBeforeExpiry.id, 'failed-job');
+  assert.equal(justBeforeExpiry.errorCode, 'ROBOTS_DISALLOWED');
   assert.equal(justBeforeExpiry.retryAt, '2026-11-15T12:00:00.000Z');
   assert.equal(justBeforeExpiry.remainingMs, 1);
 
@@ -299,6 +352,72 @@ test('applies a 24-hour cooldown after failed crawls without changing the succes
   });
   assert.equal(afterExpiry, null);
   assert.equal(FAILED_CRAWL_RETRY_MS, WATCH_TTL_MS);
+});
+
+test('uses a shorter retry delay for transient upstream HTTP errors', async () => {
+  const db = createFakeDb();
+  const url = 'https://temporary.example/';
+  const failedAt = '2026-11-14T12:00:00.000Z';
+  db.state.jobs.set('temporary-job', {
+    id: 'temporary-job', url, status: 'failed', finished_at: failedAt,
+  });
+  db.state.pages.set('temporary-job:' + url, {
+    job_id: 'temporary-job', url, depth: 0, status: 'failed',
+    error_code: 'UPSTREAM_HTTP_ERROR',
+    upstream_http_status: 503,
+    retry_after_at: null,
+  });
+
+  const blocked = await getRecentFailedCrawlJob(db, url, {
+    now: Date.parse('2026-11-14T12:14:59.999Z'),
+  });
+  assert.equal(blocked.retryAt, '2026-11-14T12:15:00.000Z');
+  assert.equal(blocked.remainingMs, 1);
+
+  const eligible = await getRecentFailedCrawlJob(db, url, {
+    now: Date.parse('2026-11-14T12:15:00.000Z'),
+  });
+  assert.equal(eligible, null);
+});
+
+test('honors upstream Retry-After as a minimum and uses a one-hour 429 fallback', async () => {
+  const db = createFakeDb();
+  const url = 'https://rate-limited.example/';
+  const failedAt = '2026-11-14T12:00:00.000Z';
+  db.state.jobs.set('rate-job', {
+    id: 'rate-job', url, status: 'failed', finished_at: failedAt,
+  });
+  db.state.pages.set('rate-job:' + url, {
+    job_id: 'rate-job', url, depth: 0, status: 'failed',
+    error_code: 'UPSTREAM_HTTP_ERROR',
+    upstream_http_status: 429,
+    retry_after_at: '2026-11-14T14:00:00.000Z',
+  });
+
+  const retry = await getRecentFailedCrawlJob(db, url, {
+    now: Date.parse('2026-11-14T13:59:59.999Z'),
+  });
+  assert.equal(retry.retryAt, '2026-11-14T14:00:00.000Z');
+  assert.equal(retry.remainingMs, 1);
+});
+
+test('records upstream status and Retry-After on the failed page', async () => {
+  const db = createFakeDb();
+  const url = 'https://upstream.example/';
+  await insertCrawlJob(db, { id: 'status-job', url });
+  await insertCrawlPage(db, { jobId: 'status-job', url, depth: 0 });
+
+  await failCrawlPage(db, 'status-job', url, {
+    attempts: 1,
+    errorCode: 'UPSTREAM_HTTP_ERROR',
+    errorMessage: 'UPSTREAM_HTTP_ERROR',
+    upstreamHttpStatus: 429,
+    retryAfterAt: '2026-11-14T14:00:00.000Z',
+  });
+
+  const page = await getCrawlPage(db, 'status-job', url);
+  assert.equal(page.upstream_http_status, 429);
+  assert.equal(page.retry_after_at, '2026-11-14T14:00:00.000Z');
 });
 
 test('rejects unsupported job update fields', async () => {
