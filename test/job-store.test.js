@@ -4,6 +4,8 @@ import {
   insertCrawlJob,
   getCrawlJob,
   getActiveCrawlJob,
+  getRecentFailedCrawlJob,
+  FAILED_CRAWL_RETRY_MS,
   watchTTL,
   WATCH_TTL_MS,
   updateCrawlJob,
@@ -142,6 +144,11 @@ function createFakeDb() {
             completed: pages.filter((page) => page.status === 'completed').length,
           };
         }
+        if (sql.includes("status = 'failed'") && sql.includes('FROM crawl_jobs') && sql.includes('url = ?')) {
+          return [...state.jobs.values()]
+            .filter((job) => job.url === values[0] && job.status === 'failed' && job.finished_at)
+            .sort((left, right) => Date.parse(right.finished_at) - Date.parse(left.finished_at))[0] || null;
+        }
         if (sql.includes('FROM crawl_jobs') && sql.includes('url = ?')) {
           return [...state.jobs.values()].find((job) => (
             job.url === values[0] && ['queued', 'running'].includes(job.status)
@@ -266,6 +273,31 @@ test('finds an already active root crawl by URL', async () => {
   const db = createFakeDb();
   await insertCrawlJob(db, { id: 'active-job', url: 'https://example.com/' });
   assert.equal((await getActiveCrawlJob(db, 'https://example.com/')).id, 'active-job');
+});
+
+test('applies a 24-hour cooldown after failed crawls without changing the success TTL', async () => {
+  const db = createFakeDb();
+  const url = 'https://blocked.example/';
+  const failedAt = '2026-11-14T12:00:00.000Z';
+  db.state.jobs.set('failed-job', {
+    id: 'failed-job',
+    url,
+    status: 'failed',
+    finished_at: failedAt,
+  });
+
+  const justBeforeExpiry = await getRecentFailedCrawlJob(db, url, {
+    now: Date.parse('2026-11-15T11:59:59.999Z'),
+  });
+  assert.equal(justBeforeExpiry.id, 'failed-job');
+  assert.equal(justBeforeExpiry.retryAt, '2026-11-15T12:00:00.000Z');
+  assert.equal(justBeforeExpiry.remainingMs, 1);
+
+  const afterExpiry = await getRecentFailedCrawlJob(db, url, {
+    now: Date.parse('2026-11-15T12:00:00.000Z'),
+  });
+  assert.equal(afterExpiry, null);
+  assert.equal(FAILED_CRAWL_RETRY_MS, WATCH_TTL_MS);
 });
 
 test('rejects unsupported job update fields', async () => {
