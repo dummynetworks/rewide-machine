@@ -53,7 +53,7 @@ function createDb() {
           if (page) {
             if (sql.includes("SET status = 'completed'")) page.status = 'completed';
             if (sql.includes("SET status = 'failed'")) page.status = 'failed';
-            const fields = [...sql.matchAll(/([a-z_]+) = \\?/g)].map((match) => match[1]);
+            const fields = [...sql.matchAll(/([a-z_]+) = \?/g)].map((match) => match[1]);
             fields.forEach((field, index) => { page[field] = values[index]; });
             changes = 1;
           }
