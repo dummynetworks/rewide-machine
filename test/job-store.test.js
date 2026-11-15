@@ -102,6 +102,13 @@ function createFakeDb() {
             if (anchorText && !previous.anchorText.includes(anchorText)) previous.anchorText = (previous.anchorText + ' ' + anchorText).trim().slice(0, 2000);
             previous.discoveredAt = previous.discoveredAt || discoveredAt;
             previous.updatedAt = updatedAt;
+          } else if (sql.includes("VALUES (?, NULL, NULL, 'seed'")) {
+            const [, title, description, noindexStatus, discoveredAt, updatedAt] = values;
+            previous.title = title;
+            previous.description = description;
+            previous.noindexStatus = noindexStatus;
+            previous.discoveredAt = previous.discoveredAt || discoveredAt;
+            previous.updatedAt = updatedAt;
           } else {
             const [, resolvedUrl, title, description, noindexStatus, discoveredAt, updatedAt] = values;
             previous.resolvedUrl = resolvedUrl;
