@@ -168,6 +168,8 @@ npm run seed:tranco -- --submit --limit 100 --max-pages 5 --max-depth 1
 
 The importer stops after an authentication or configuration failure (HTTP 401, 403, or 503). A run report records `fresh`, `queued`, `deduplicated`, `cooldown`, `failed`, and not-submitted counts. `cooldown` means the Worker has a recent failed crawl for that URL and is deferring another attempt until `retryAt`; it is not a newly failed submission. It never writes the Worker secret to the report.
 
+See [the complete Tranco Worker response contract](docs/tranco-worker-response-contract.md) for every JSON success and error response accepted by the seeder.
+
 Tranco publishes a daily ranking and provides permanent list IDs for reproducibility. The importer records the selected list ID and source URL rather than committing the ranking file to this repository. See [Tranco](https://tranco-list.eu/) and its [API documentation](https://tranco-list.eu/api_documentation). Tranco aggregates rankings from external providers; consult its attribution and provider-license notes before redistributing any list data.
 
 ## Local development
