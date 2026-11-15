@@ -282,6 +282,63 @@ test('POST /v1/crawl rejects unsafe or invalid crawl limits', async () => {
   assert.equal((await response.json()).error, 'INVALID_CRAWL_LIMITS');
 });
 
+test('blocks a crawl when the fifth redirect is returned', async () => {
+  const DB = createDb();
+  const CRAWL_QUEUE = { async send() {} };
+  const startUrl = 'http://redirect-limit.example/';
+  const created = await submitCrawl({
+    DB,
+    CRAWL_QUEUE,
+    payload: { url: startUrl },
+  });
+  const { jobId } = await created.json();
+
+  const redirectTargets = [
+    'https://www.redirect-limit.example/step-1',
+    'https://redirect-limit.example/step-2',
+    'https://www.redirect-limit.example/step-3',
+    'https://redirect-limit.example/step-4',
+    'https://www.redirect-limit.example/step-5',
+  ];
+  const requestedPages = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input) => {
+    const requestUrl = new URL(input);
+    if (requestUrl.pathname === '/robots.txt') {
+      return new Response('', { status: 404 });
+    }
+
+    requestedPages.push(requestUrl.href);
+    const location = redirectTargets[requestedPages.length - 1];
+    return new Response(null, {
+      status: 301,
+      headers: { location },
+    });
+  };
+
+  let acknowledged = false;
+  try {
+    await worker.queue({
+      messages: [{
+        body: { jobId, url: startUrl, depth: 0, parentUrl: null },
+        attempts: 1,
+        ack() { acknowledged = true; },
+        retry() { assert.fail('A redirect-limit result must be acknowledged, not retried.'); },
+      }],
+    }, { DB, CRAWL_QUEUE, DUMMYNET_TOKEN: TOKEN });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const rootPage = DB.pages.get(`${jobId}:${startUrl}`);
+  assert.equal(requestedPages.length, 5);
+  assert.equal(requestedPages.includes(redirectTargets[4]), false);
+  assert.equal(rootPage.status, 'failed');
+  assert.equal(rootPage.error_code, 'REDIRECT_LIMIT');
+  assert.equal(acknowledged, true);
+});
+
 test('GET /v1/jobs/:id returns persisted job state', async () => {
   const DB = createDb();
   const sent = [];
