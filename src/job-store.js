@@ -1,3 +1,5 @@
+import { calculateFailureRetryAt } from './retry-policy.js';
+
 const JOB_COLUMNS = `
   id, url, status, attempts, created_at, updated_at, finished_at,
   document_url, error_code, error_message, max_pages, max_depth,
