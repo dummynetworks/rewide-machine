@@ -473,6 +473,38 @@ test('stores a page document and completes its frontier row in one D1 batch', as
   assert.deepEqual(db.state.batches, [4]);
 });
 
+test('stores the final Origin after a permitted root redirect', async () => {
+  const db = createFakeDb();
+  const originalUrl = 'http://example.com/';
+  const finalUrl = 'https://www.example.com/';
+  await insertCrawlJob(db, { id: 'redirect-job', url: originalUrl, maxPages: 2 });
+  await insertCrawlPage(db, { jobId: 'redirect-job', url: originalUrl, depth: 0 });
+
+  const redirectedDocument = {
+    ...sampleDocument,
+    url: finalUrl,
+    links: ['https://www.example.com/about'],
+  };
+  await saveDocumentAndCompletePage(
+    db,
+    'redirect-job',
+    originalUrl,
+    redirectedDocument,
+    '2026-11-14T00:00:01.000Z',
+    'https://www.example.com',
+  );
+
+  const job = await getCrawlJob(db, 'redirect-job');
+  const freshness = await watchTTL(db, originalUrl, {
+    now: Date.parse('2026-11-14T01:00:00.000Z'),
+  });
+
+  assert.equal(job.scope_origin, 'https://www.example.com');
+  assert.equal(db.state.discoveredUrls.get(originalUrl).resolvedUrl, finalUrl);
+  assert.equal(freshness.isFresh, true);
+  assert.equal(freshness.document.url, finalUrl);
+});
+
 test('finalizes an idle crawl job based on successful pages', async () => {
   const db = createFakeDb();
   await insertCrawlJob(db, { id: 'job-3', url: sampleDocument.url });
