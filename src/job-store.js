@@ -52,6 +52,38 @@ export async function getActiveCrawlJob(db, url) {
   `).bind(url).first();
 }
 
+export const FAILED_CRAWL_RETRY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Prevent permanent or robots-blocked URLs from being retried on every search.
+ * This is a retry cooldown only; successful-document freshness still uses watchTTL.
+ */
+export async function getRecentFailedCrawlJob(db, url, {
+  now = Date.now(),
+  retryMs = FAILED_CRAWL_RETRY_MS,
+} = {}) {
+  const job = await db.prepare(`
+    SELECT id, finished_at AS finishedAt
+    FROM crawl_jobs
+    WHERE url = ? AND status = 'failed' AND finished_at IS NOT NULL
+    ORDER BY finished_at DESC
+    LIMIT 1
+  `).bind(url).first();
+
+  const failedAt = Date.parse(job?.finishedAt ?? '');
+  if (!Number.isFinite(failedAt)) return null;
+
+  const ageMs = now - failedAt;
+  if (ageMs >= retryMs) return null;
+
+  return {
+    id: job.id,
+    failedAt: job.finishedAt,
+    retryAt: new Date(failedAt + retryMs).toISOString(),
+    remainingMs: Math.max(0, retryMs - ageMs),
+  };
+}
+
 export async function updateCrawlJob(db, id, fields) {
   const assignments = [];
   const values = [];
