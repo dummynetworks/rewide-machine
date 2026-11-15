@@ -1,5 +1,5 @@
 import { createRobotsPolicy } from './robots.js';
-import { insertCrawlJob, getCrawlJob, getActiveCrawlJob, updateCrawlJob, insertCrawlPage, getCrawlPage, getCrawlPages, updateCrawlPage, saveDocumentAndCompletePage, completeCrawlPageAsSkipped, failCrawlPage, finalizeCrawlJobIfIdle, getDocument, upsertDiscoveredUrl, watchTTL, WATCH_TTL_MS } from './job-store.js';
+import { insertCrawlJob, getCrawlJob, getActiveCrawlJob, getRecentFailedCrawlJob, updateCrawlJob, insertCrawlPage, getCrawlPage, getCrawlPages, updateCrawlPage, saveDocumentAndCompletePage, completeCrawlPageAsSkipped, failCrawlPage, finalizeCrawlJobIfIdle, getDocument, upsertDiscoveredUrl, watchTTL, WATCH_TTL_MS } from './job-store.js';
 import { selectCrawlLinks } from './frontier.js';
 
 const USER_AGENT = 'rewidebot/0.1';
@@ -701,6 +701,7 @@ export default {
 
       let freshness;
       let activeJob;
+      let recentFailure;
       try {
         freshness = await watchTTL(env.DB, checked.url);
         if (freshness.isFresh) {
@@ -714,6 +715,9 @@ export default {
           }, 200);
         }
         activeJob = await getActiveCrawlJob(env.DB, checked.url);
+        if (!activeJob) {
+          recentFailure = await getRecentFailedCrawlJob(env.DB, checked.url);
+        }
       } catch {
         return json({
           error: 'WATCH_TTL_FAILED',
@@ -733,6 +737,17 @@ export default {
           maxDepth: activeJob.max_depth,
           scope: 'same-origin',
         }, 202);
+      }
+
+      if (recentFailure) {
+        return json({
+          url: checked.url,
+          status: 'cooldown',
+          cached: Boolean(freshness.document),
+          crawlRequired: false,
+          retryAt: recentFailure.retryAt,
+          previousFailureAt: recentFailure.failedAt,
+        }, 200);
       }
 
       const requestedMaxPages = parsed.payload?.maxPages ?? 1;
