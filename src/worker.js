@@ -3,7 +3,7 @@ import { insertCrawlJob, getCrawlJob, getActiveCrawlJob, getRecentFailedCrawlJob
 import { selectCrawlLinks } from './frontier.js';
 import { isAllowedCrawlRedirect } from './redirect-policy.js';
 import { parseRetryAfterAt } from './retry-policy.js';
-import { ARTICLE_BODY_TEXT_SELECTORS, REMOVE_CONTENT_SELECTORS, selectArticleText } from './content-selectors.js';
+import { ARTICLE_BODY_TEXT_SELECTORS, REMOVE_CONTENT_SELECTORS, selectArticleText, validateCanonicalUrl } from './content-selectors.js';
 
 const USER_AGENT = 'rewidebot/0.1';
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
@@ -171,6 +171,7 @@ function collectDocument(htmlResponse, finalUrl) {
     title: '',
     description: '',
     canonicalUrl: null,
+    canonicalStatus: 'missing',
     language: null,
     text: '',
     links: [],
@@ -193,6 +194,7 @@ function collectDocument(htmlResponse, finalUrl) {
 
   let bodyResponse;
   const linkStack = [];
+  let canonicalSeen = false;
   const rewriter = new HTMLRewriter()
     .on('html', {
       element(element) {
@@ -227,8 +229,15 @@ function collectDocument(htmlResponse, finalUrl) {
     })
     .on('link[rel~="canonical"]', {
       element(element) {
-        const href = element.getAttribute('href');
-        if (href) document.canonicalUrl = normalizePublicUrl(href, finalUrl);
+        if (canonicalSeen) return;
+        canonicalSeen = true;
+        const canonical = validateCanonicalUrl(
+          element.getAttribute('href'),
+          finalUrl,
+          normalizePublicUrl,
+        );
+        document.canonicalUrl = canonical.canonicalUrl;
+        document.canonicalStatus = canonical.canonicalStatus;
       },
     })
     .on('a[href]', {
@@ -532,8 +541,11 @@ async function handleQueueMessage(message, env) {
       return;
     }
 
+    const latestJob = await getCrawlJob(env.DB, body.jobId);
+    const forceReindex = depthFromMessage === 0
+      && Number(latestJob?.force_reindex ?? job.force_reindex ?? 0) === 1;
     const freshness = await watchTTL(env.DB, pageUrl);
-    if (freshness.isFresh) {
+    if (freshness.isFresh && !forceReindex) {
       await completeCrawlPageAsSkipped(env.DB, body.jobId, pageUrl);
       await finalizeCrawlJobIfIdle(env.DB, body.jobId);
       message.ack();
@@ -760,64 +772,12 @@ export default {
       if (parsed.error) return json({ error: parsed.error }, parsed.error === 'REQUEST_TOO_LARGE' ? 413 : 400);
       const checked = requestUrl(parsed.payload);
       if (checked.error) return json({ error: checked.error, message: checked.message }, 400);
-
-      try {
-        await upsertDiscoveredUrl(env.DB, { url: checked.url, sourceType: 'seed' });
-      } catch {
-        return json({ error: 'DISCOVERY_RECORD_FAILED' }, 503);
-      }
-
-      let freshness;
-      let activeJob;
-      let recentFailure;
-      try {
-        freshness = await watchTTL(env.DB, checked.url);
-        if (freshness.isFresh) {
-          return json({
-            url: checked.url,
-            status: 'fresh',
-            cached: true,
-            crawlRequired: false,
-            fetchedAt: freshness.fetchedAt,
-            ttlExpiresAt: freshness.expiresAt,
-          }, 200);
-        }
-        activeJob = await getActiveCrawlJob(env.DB, checked.url);
-        if (!activeJob) {
-          recentFailure = await getRecentFailedCrawlJob(env.DB, checked.url);
-        }
-      } catch {
+      const forceReindex = parsed.payload?.forceReindex ?? false;
+      if (typeof forceReindex !== 'boolean') {
         return json({
-          error: 'WATCH_TTL_FAILED',
-          message: 'Unable to check the URL crawl history in D1.',
-        }, 503);
-      }
-
-      if (activeJob) {
-        return json({
-          jobId: activeJob.id,
-          url: checked.url,
-          status: activeJob.status,
-          createdAt: activeJob.created_at,
-          crawlRequired: false,
-          deduplicated: true,
-          maxPages: activeJob.max_pages,
-          maxDepth: activeJob.max_depth,
-          scope: 'same-origin',
-        }, 202);
-      }
-
-      if (recentFailure) {
-        return json({
-          url: checked.url,
-          status: 'cooldown',
-          cached: Boolean(freshness.document),
-          crawlRequired: false,
-          retryAt: recentFailure.retryAt,
-          previousFailureAt: recentFailure.failedAt,
-          errorCode: recentFailure.errorCode,
-          upstreamHttpStatus: recentFailure.upstreamHttpStatus,
-        }, 200);
+          error: 'INVALID_REINDEX_FLAG',
+          message: 'forceReindex must be a boolean.',
+        }, 400);
       }
 
       const requestedMaxPages = parsed.payload?.maxPages ?? 1;
@@ -835,6 +795,80 @@ export default {
           message: 'maxPages must be an integer from 1 to 50; maxDepth must be an integer from 0 to 5.',
         }, 400);
       }
+      if (forceReindex && (requestedMaxPages !== 1 || requestedMaxDepth !== 0)) {
+        return json({
+          error: 'INVALID_REINDEX_LIMITS',
+          message: 'A forced reindex is limited to one page with maxDepth 0.',
+        }, 400);
+      }
+
+      try {
+        await upsertDiscoveredUrl(env.DB, { url: checked.url, sourceType: 'seed' });
+      } catch {
+        return json({ error: 'DISCOVERY_RECORD_FAILED' }, 503);
+      }
+
+      let freshness;
+      let activeJob;
+      let recentFailure;
+      try {
+        freshness = await watchTTL(env.DB, checked.url);
+        if (freshness.isFresh && !forceReindex) {
+          return json({
+            url: checked.url,
+            status: 'fresh',
+            cached: true,
+            crawlRequired: false,
+            fetchedAt: freshness.fetchedAt,
+            ttlExpiresAt: freshness.expiresAt,
+          }, 200);
+        }
+        activeJob = await getActiveCrawlJob(env.DB, checked.url);
+        if (!activeJob && !forceReindex) {
+          recentFailure = await getRecentFailedCrawlJob(env.DB, checked.url);
+        }
+      } catch {
+        return json({
+          error: 'WATCH_TTL_FAILED',
+          message: 'Unable to check the URL crawl history in D1.',
+        }, 503);
+      }
+
+      if (activeJob) {
+        if (forceReindex && Number(activeJob.force_reindex || 0) !== 1) {
+          await updateCrawlJob(env.DB, activeJob.id, {
+            force_reindex: 1,
+            updated_at: new Date().toISOString(),
+          });
+        }
+        return json({
+          jobId: activeJob.id,
+          url: checked.url,
+          status: activeJob.status,
+          createdAt: activeJob.created_at,
+          crawlRequired: false,
+          deduplicated: true,
+          maxPages: activeJob.max_pages,
+          maxDepth: activeJob.max_depth,
+          scope: 'same-origin',
+          ...(forceReindex ? { forceReindex: true } : {}),
+        }, 202);
+      }
+
+      if (recentFailure) {
+        return json({
+          url: checked.url,
+          status: 'cooldown',
+          cached: Boolean(freshness.document),
+          crawlRequired: false,
+          retryAt: recentFailure.retryAt,
+          previousFailureAt: recentFailure.failedAt,
+          errorCode: recentFailure.errorCode,
+          upstreamHttpStatus: recentFailure.upstreamHttpStatus,
+        }, 200);
+      }
+
+
 
       const jobId = crypto.randomUUID();
       const now = new Date().toISOString();
@@ -845,6 +879,7 @@ export default {
             url: checked.url,
             maxPages: requestedMaxPages,
             maxDepth: requestedMaxDepth,
+            forceReindex,
             now,
           });
         } catch (error) {
@@ -860,6 +895,7 @@ export default {
               maxPages: concurrentJob.max_pages,
               maxDepth: concurrentJob.max_depth,
               scope: 'same-origin',
+              ...(forceReindex ? { forceReindex: true } : {}),
             }, 202);
           }
           throw error;
@@ -886,7 +922,7 @@ export default {
         return json({ error: 'QUEUE_ENQUEUE_FAILED' }, 503);
       }
 
-      return json({ jobId, url: checked.url, status: 'queued', createdAt: now, maxPages: requestedMaxPages, maxDepth: requestedMaxDepth, scope: 'same-origin' }, 202);
+      return json({ jobId, url: checked.url, status: 'queued', createdAt: now, maxPages: requestedMaxPages, maxDepth: requestedMaxDepth, scope: 'same-origin', ...(forceReindex ? { forceReindex: true } : {}) }, 202);
     }
 
     return json({ error: 'NOT_FOUND' }, 404);

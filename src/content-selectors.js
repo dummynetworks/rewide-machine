@@ -62,3 +62,38 @@ export function selectArticleText(candidates, maxLength = 100_000) {
 
   return '';
 }
+
+
+/**
+ * Validate a canonical target as a safe HTTP(S) URL and classify its
+ * relationship to the fetched page. Cross-origin values remain metadata only.
+ * The caller injects its public-URL normalizer so Worker and Node policies stay
+ * separate while sharing the same classification logic.
+ */
+export function validateCanonicalUrl(href, pageUrl, normalize) {
+  if (typeof href !== 'string' || href.trim() === '') {
+    return { canonicalUrl: null, canonicalStatus: 'missing' };
+  }
+  if (typeof normalize !== 'function') {
+    throw new TypeError('A public URL normalizer is required.');
+  }
+
+  const canonicalUrl = normalize(href.trim(), pageUrl);
+  const normalizedPageUrl = normalize(pageUrl);
+  if (!canonicalUrl || !normalizedPageUrl) {
+    return { canonicalUrl: null, canonicalStatus: 'invalid' };
+  }
+
+  try {
+    const canonical = new URL(canonicalUrl);
+    const page = new URL(normalizedPageUrl);
+    return {
+      canonicalUrl,
+      canonicalStatus: canonical.href === page.href
+        ? 'self'
+        : canonical.origin === page.origin ? 'same-origin' : 'cross-origin',
+    };
+  } catch {
+    return { canonicalUrl: null, canonicalStatus: 'invalid' };
+  }
+}

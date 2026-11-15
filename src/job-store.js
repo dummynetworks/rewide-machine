@@ -3,7 +3,7 @@ import { calculateFailureRetryAt } from './retry-policy.js';
 const JOB_COLUMNS = `
   id, url, status, attempts, created_at, updated_at, finished_at,
   document_url, error_code, error_message, max_pages, max_depth,
-  pages_crawled, pages_failed, pages_skipped, scope_origin
+  pages_crawled, pages_failed, pages_skipped, scope_origin, force_reindex
 `;
 
 const PAGE_COLUMNS = `
@@ -17,13 +17,14 @@ export async function insertCrawlJob(db, {
   url,
   maxPages = 1,
   maxDepth = 0,
+  forceReindex = false,
   now = new Date().toISOString(),
 }) {
   await db.prepare(`
     INSERT INTO crawl_jobs (
-      id, url, status, attempts, created_at, updated_at, max_pages, max_depth, scope_origin
-    ) VALUES (?, ?, 'queued', 0, ?, ?, ?, ?, ?)
-  `).bind(id, url, now, now, maxPages, maxDepth, new URL(url).origin).run();
+      id, url, status, attempts, created_at, updated_at, max_pages, max_depth, scope_origin, force_reindex
+    ) VALUES (?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?)
+  `).bind(id, url, now, now, maxPages, maxDepth, new URL(url).origin, forceReindex ? 1 : 0).run();
 
   return {
     id,
@@ -35,6 +36,7 @@ export async function insertCrawlJob(db, {
     max_pages: maxPages,
     max_depth: maxDepth,
     scope_origin: new URL(url).origin,
+    force_reindex: forceReindex ? 1 : 0,
     pages_crawled: 0,
     pages_failed: 0,
   };
@@ -110,7 +112,7 @@ export async function updateCrawlJob(db, id, fields) {
   const values = [];
 
   for (const [key, value] of Object.entries(fields)) {
-    if (!['status', 'attempts', 'updated_at', 'finished_at', 'document_url', 'error_code', 'error_message', 'scope_origin'].includes(key)) {
+    if (!['status', 'attempts', 'updated_at', 'finished_at', 'document_url', 'error_code', 'error_message', 'scope_origin', 'force_reindex'].includes(key)) {
       throw new TypeError(`Unsupported crawl job field: ${key}`);
     }
     assignments.push(`${key} = ?`);
@@ -251,9 +253,9 @@ export async function saveDocumentAndCompletePage(
   const documentStatement = db.prepare(`
     INSERT INTO documents (
       url, fetched_at, http_status, content_type, title, description,
-      canonical_url, language, text, links_json, no_index, no_follow,
+      canonical_url, canonical_status, language, text, links_json, no_index, no_follow,
       indexable, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(url) DO UPDATE SET
       fetched_at = excluded.fetched_at,
       http_status = excluded.http_status,
@@ -261,6 +263,7 @@ export async function saveDocumentAndCompletePage(
       title = excluded.title,
       description = excluded.description,
       canonical_url = excluded.canonical_url,
+      canonical_status = excluded.canonical_status,
       language = excluded.language,
       text = excluded.text,
       links_json = excluded.links_json,
@@ -276,6 +279,7 @@ export async function saveDocumentAndCompletePage(
     document.title,
     document.description,
     document.canonicalUrl,
+    document.canonicalStatus ?? (document.canonicalUrl ? 'unverified' : 'missing'),
     document.language,
     document.text,
     JSON.stringify(document.links),
@@ -419,9 +423,9 @@ export async function saveDocumentAndCompleteJob(db, jobId, document, now = new 
   const documentStatement = db.prepare(`
     INSERT INTO documents (
       url, fetched_at, http_status, content_type, title, description,
-      canonical_url, language, text, links_json, no_index, no_follow,
+      canonical_url, canonical_status, language, text, links_json, no_index, no_follow,
       indexable, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(url) DO UPDATE SET
       fetched_at = excluded.fetched_at,
       http_status = excluded.http_status,
@@ -429,6 +433,7 @@ export async function saveDocumentAndCompleteJob(db, jobId, document, now = new 
       title = excluded.title,
       description = excluded.description,
       canonical_url = excluded.canonical_url,
+      canonical_status = excluded.canonical_status,
       language = excluded.language,
       text = excluded.text,
       links_json = excluded.links_json,
@@ -444,6 +449,7 @@ export async function saveDocumentAndCompleteJob(db, jobId, document, now = new 
     document.title,
     document.description,
     document.canonicalUrl,
+    document.canonicalStatus ?? (document.canonicalUrl ? 'unverified' : 'missing'),
     document.language,
     document.text,
     JSON.stringify(document.links),
@@ -526,7 +532,8 @@ async function getDocumentResolved(db, url, seen) {
   const row = await db.prepare(`
     SELECT url, fetched_at AS fetchedAt, http_status AS httpStatus,
       content_type AS contentType, title, description,
-      canonical_url AS canonicalUrl, language, text, links_json AS linksJson,
+      canonical_url AS canonicalUrl, canonical_status AS canonicalStatus,
+      language, text, links_json AS linksJson,
       no_index AS noIndex, no_follow AS noFollow, indexable, updated_at AS updatedAt
     FROM documents WHERE url = ? LIMIT 1
   `).bind(url).first();

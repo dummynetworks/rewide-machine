@@ -158,3 +158,29 @@ test('falls back to main and body text when semantic article containers are abse
   );
   assert.match(bodyDocument.text, /Plain page without semantic containers/);
 });
+
+
+test('classifies canonical URLs without replacing the fetched page URL', () => {
+  const sameOrigin = extractDocument(
+    '<html><head><link rel="canonical" href="/preferred"></head><body><main>Page</main></body></html>',
+    'https://example.com/source',
+  );
+  assert.equal(sameOrigin.canonicalUrl, 'https://example.com/preferred');
+  assert.equal(sameOrigin.canonicalStatus, 'same-origin');
+  assert.equal(sameOrigin.url, 'https://example.com/source');
+
+  const crossOrigin = extractDocument(
+    '<html><head><link rel="canonical" href="https://publisher.example/story"></head><body><article>Story</article></body></html>',
+    'https://syndication.example/story',
+  );
+  assert.equal(crossOrigin.canonicalUrl, 'https://publisher.example/story');
+  assert.equal(crossOrigin.canonicalStatus, 'cross-origin');
+  assert.equal(crossOrigin.url, 'https://syndication.example/story');
+
+  const invalid = extractDocument(
+    '<html><head><link rel="canonical" href="javascript:alert(1)"></head><body>Page</body></html>',
+    'https://example.com/story',
+  );
+  assert.equal(invalid.canonicalUrl, null);
+  assert.equal(invalid.canonicalStatus, 'invalid');
+});

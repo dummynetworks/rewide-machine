@@ -46,6 +46,7 @@ function createFakeDb() {
             created_at: createdAt, updated_at: updatedAt,
             max_pages: maxPages, max_depth: maxDepth,
             scope_origin: new URL(url).origin,
+            force_reindex: values[7] ?? 0,
             pages_crawled: 0, pages_failed: 0,
           });
           changes = 1;
@@ -126,11 +127,11 @@ function createFakeDb() {
           changes = 1;
         } else if (sql.includes('INSERT INTO documents')) {
           const [url, fetchedAt, httpStatus, contentType, title, description,
-            canonicalUrl, language, text, linksJson, noIndex, noFollow,
+            canonicalUrl, canonicalStatus, language, text, linksJson, noIndex, noFollow,
             indexable, updatedAt] = values;
           state.documents.set(url, {
             url, fetchedAt, httpStatus, contentType, title, description,
-            canonicalUrl, language, text, linksJson, noIndex, noFollow,
+            canonicalUrl, canonicalStatus, language, text, linksJson, noIndex, noFollow,
             indexable, updatedAt,
           });
           changes = 1;
@@ -206,6 +207,7 @@ const sampleDocument = {
   title: 'Example',
   description: '',
   canonicalUrl: null,
+  canonicalStatus: 'missing',
   language: 'en',
   text: 'Example body',
   links: ['https://example.com/about'],
@@ -251,6 +253,23 @@ test('insert and retrieve a queued crawl job', async () => {
   assert.equal(job.status, 'queued');
   assert.equal((await getCrawlJob(db, 'job-1')).url, 'https://example.com/');
   assert.equal((await getCrawlJob(db, 'job-1')).max_pages, 4);
+});
+
+test('persists a forced reindex flag on the crawl job', async () => {
+  const db = createFakeDb();
+  const standard = await insertCrawlJob(db, {
+    id: 'standard-job',
+    url: 'https://example.com/standard',
+  });
+  const forced = await insertCrawlJob(db, {
+    id: 'forced-job',
+    url: 'https://example.com/forced',
+    forceReindex: true,
+  });
+
+  assert.equal(standard.force_reindex, 0);
+  assert.equal(forced.force_reindex, 1);
+  assert.equal((await getCrawlJob(db, 'forced-job')).force_reindex, 1);
 });
 
 test('watchTTL resolves a redirected root URL to its successfully stored final URL', async () => {

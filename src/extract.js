@@ -1,6 +1,6 @@
 import * as cheerio from 'cheerio';
 import { normalizeUrl } from './url.js';
-import { ARTICLE_BODY_SELECTORS, REMOVE_CONTENT_SELECTORS, selectArticleText } from './content-selectors.js';
+import { ARTICLE_BODY_SELECTORS, REMOVE_CONTENT_SELECTORS, selectArticleText, validateCanonicalUrl } from './content-selectors.js';
 
 function directiveSet(...values) {
   const directives = new Set();
@@ -39,10 +39,11 @@ export function extractDocument(input, pageUrl, headers = new Headers(), options
     || ''
   ).replace(/\s+/g, ' ').trim().slice(0, 2_000);
 
-  const canonicalHref = $('link[rel~="canonical"]').first().attr('href');
-  const canonicalUrl = canonicalHref
-    ? normalizeUrl(canonicalHref, pageUrl)
-    : null;
+  const canonical = validateCanonicalUrl(
+    $('link[rel~="canonical"]').first().attr('href'),
+    pageUrl,
+    normalizeUrl,
+  );
 
   const language = ($('html').attr('lang') || '').trim().slice(0, 35) || null;
   const metaRobots = [
@@ -88,7 +89,8 @@ export function extractDocument(input, pageUrl, headers = new Headers(), options
     url: pageUrl,
     title,
     description,
-    canonicalUrl,
+    canonicalUrl: canonical.canonicalUrl,
+    canonicalStatus: canonical.canonicalStatus,
     language,
     text,
     links,
