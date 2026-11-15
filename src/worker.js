@@ -885,6 +885,12 @@ export default {
         } catch (error) {
           const concurrentJob = await getActiveCrawlJob(env.DB, checked.url).catch(() => null);
           if (concurrentJob) {
+            if (forceReindex && Number(concurrentJob.force_reindex || 0) !== 1) {
+              await updateCrawlJob(env.DB, concurrentJob.id, {
+                force_reindex: 1,
+                updated_at: new Date().toISOString(),
+              });
+            }
             return json({
               jobId: concurrentJob.id,
               url: checked.url,

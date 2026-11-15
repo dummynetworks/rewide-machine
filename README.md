@@ -9,7 +9,7 @@ It is kept separate from the rewide search frontend and search API.
 The production entry point is `src/worker.js`, configured by `wrangler.jsonc`.
 
 - `GET /health` — public Worker health check and configured capability flags.
-- `POST /v1/crawl` — authenticated asynchronous crawl submission. Returns `202` and a `jobId`.
+- `POST /v1/crawl` — authenticated asynchronous crawl submission. Returns `202` and a `jobId`; accepts `forceReindex: true` for an explicitly requested one-page refresh.
 - `GET /v1/jobs/:jobId` — authenticated crawl job status and page counters.
 - `GET /v1/jobs/:jobId/pages` — authenticated per-URL frontier status for a crawl job.
 - `GET /v1/documents?url=<encoded-url>` — authenticated stored document lookup.
@@ -19,7 +19,7 @@ The production entry point is `src/worker.js`, configured by `wrangler.jsonc`.
 
 Crawling is user-triggered, not scheduled. Every `POST /v1/crawl` request passes through the D1-backed `watchTTL` check before a job is created:
 
-- A document fetched less than 24 hours ago is reused. The endpoint returns `200` with `status: "fresh"` and does not enqueue a crawl.
+- A document fetched less than 24 hours ago is reused. The endpoint returns `200` with `status: "fresh"` and does not enqueue a crawl unless the authenticated request explicitly sets `forceReindex: true`.
 - A missing document or a document at least 24 hours old is eligible for crawling.
 - If the same URL already has a queued or running root job, the endpoint returns that job instead of creating a duplicate.
 - A URL whose most recent crawl job failed is held by a reason-specific retry delay. Robots denials and out-of-scope redirects are rechecked after 24 hours; transient upstream failures (408, 425, and 5xx) are retried after 15 minutes; 429 responses use a one-hour minimum and honor a longer upstream `Retry-After` (capped at seven days); other upstream 4xx responses are retried after 6 hours. Temporary Worker retry exhaustion uses 15 minutes, and unknown failures use one hour. These delays never refresh the successful-document TTL.
@@ -35,6 +35,18 @@ Content-Type: application/json
 
 {"url":"https://example.com/"}
 ```
+
+To refresh one existing document after an extraction-policy change, submit an authenticated one-page reindex request:
+
+```http
+POST /v1/crawl
+Authorization: Bearer <DUMMYNET_TOKEN>
+Content-Type: application/json
+
+{"url":"https://example.com/article","forceReindex":true}
+```
+
+`forceReindex` bypasses the successful-document TTL and prior-failure cooldown for the root URL only. It is limited to one page (`maxPages: 1`, `maxDepth: 0`), and it does not bypass URL validation, `robots.txt`, redirect scope, or `noindex`. A failed refresh leaves the previous successful document in place. The request also promotes an already active root job when possible, and the flag is persisted in D1 so the Queue consumer can apply it after delivery.
 
 To follow links on the same origin, set bounded crawl limits:
 
@@ -106,6 +118,7 @@ Migrations:
 - `0004_on_demand_ttl.sql` adds per-job skipped-page accounting and enforces one active root crawl job per normalized URL.
 - `0005_discovered_urls.sql` stores discovered URLs separately from fetched documents and adds an FTS5 index for URL, title, description, and referring-link text. A blocked or failed crawl remains searchable as `UNKNOWN`; a fetched `noindex` page is excluded.
 - `0006_redirect_scope_retry_metadata.sql` stores the final root Origin and per-page upstream HTTP status / `Retry-After` metadata.
+- `0007_canonical_validation_and_reindex.sql` adds canonical classification and persists explicit one-page reindex requests. Existing non-empty canonical values are `unverified` until re-fetched.
 
 After the Queue exists and migrations have been applied, deploy the Worker. Wrangler configures the producer binding `CRAWL_QUEUE` and the consumer for `rewide-crawl-queue` from `wrangler.jsonc`.
 
@@ -125,6 +138,8 @@ Until the Queue binding and D1 tables are available, `GET /health` reports missi
 ### Document text extraction
 
 The Worker removes scripts, styles, navigation, footer/form/aside elements, hidden content, and common related/recommended/trending/popular-story modules before their text enters the indexed body. These filters are shared with the local Cheerio extractor to keep both paths consistent.
+
+Canonical metadata is validated as a public HTTP(S) URL and classified as `missing`, `self`, `same-origin`, `cross-origin`, or `invalid`. Cross-origin canonical URLs remain advisory metadata: they do not rewrite the fetched URL, redirect the crawler, or merge documents. Older non-empty canonical values are `unverified` until re-fetched.
 
 When available, the Worker prefers explicit article-body markers (`itemprop=articleBody`, common article/entry/post/story content containers), then semantic `article`/`main` regions, and finally falls back to the body for older pages without semantic markup. This reduces unrelated navigation and recommendation text entering the index without dropping pages that lack article markup. This is still a conservative extraction strategy, not a full readability algorithm; publisher markup varies, so validate representative sites before expanding generic removal rules.
 
