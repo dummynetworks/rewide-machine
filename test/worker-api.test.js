@@ -167,7 +167,7 @@ test('POST /v1/crawl reports the reason and retry time for a failed root job', a
     finished_at: failedAt,
     scope_origin: 'https://blocked.example',
   });
-  DB.pages.set(pageKey(jobId, url), {
+  DB.pages.set(`${jobId}:${url}`, {
     job_id: jobId,
     url,
     depth: 0,
