@@ -516,6 +516,13 @@ export async function watchTTL(db, url, {
 }
 
 export async function getDocument(db, url) {
+  return getDocumentResolved(db, url, new Set());
+}
+
+async function getDocumentResolved(db, url, seen) {
+  if (seen.has(url)) return null;
+  seen.add(url);
+
   const row = await db.prepare(`
     SELECT url, fetched_at AS fetchedAt, http_status AS httpStatus,
       content_type AS contentType, title, description,
@@ -531,11 +538,12 @@ export async function getDocument(db, url) {
       WHERE url = ? AND resolved_url IS NOT NULL
       LIMIT 1
     `).bind(url).first();
-    if (discovery?.resolvedUrl && discovery.resolvedUrl !== url) {
-      return getDocument(db, discovery.resolvedUrl);
+    if (discovery?.resolvedUrl && !seen.has(discovery.resolvedUrl)) {
+      return getDocumentResolved(db, discovery.resolvedUrl, seen);
     }
     return null;
   }
+
   let links = [];
   try {
     links = JSON.parse(row.linksJson || '[]');
