@@ -1,12 +1,13 @@
 const JOB_COLUMNS = `
   id, url, status, attempts, created_at, updated_at, finished_at,
   document_url, error_code, error_message, max_pages, max_depth,
-  pages_crawled, pages_failed, pages_skipped
+  pages_crawled, pages_failed, pages_skipped, scope_origin
 `;
 
 const PAGE_COLUMNS = `
   job_id, url, depth, status, attempts, parent_url, created_at,
-  updated_at, finished_at, error_code, error_message, skip_reason
+  updated_at, finished_at, error_code, error_message, skip_reason,
+  upstream_http_status, retry_after_at
 `;
 
 export async function insertCrawlJob(db, {
@@ -18,9 +19,9 @@ export async function insertCrawlJob(db, {
 }) {
   await db.prepare(`
     INSERT INTO crawl_jobs (
-      id, url, status, attempts, created_at, updated_at, max_pages, max_depth
-    ) VALUES (?, ?, 'queued', 0, ?, ?, ?, ?)
-  `).bind(id, url, now, now, maxPages, maxDepth).run();
+      id, url, status, attempts, created_at, updated_at, max_pages, max_depth, scope_origin
+    ) VALUES (?, ?, 'queued', 0, ?, ?, ?, ?, ?)
+  `).bind(id, url, now, now, maxPages, maxDepth, new URL(url).origin).run();
 
   return {
     id,
@@ -31,6 +32,7 @@ export async function insertCrawlJob(db, {
     updated_at: now,
     max_pages: maxPages,
     max_depth: maxDepth,
+    scope_origin: new URL(url).origin,
     pages_crawled: 0,
     pages_failed: 0,
   };
@@ -52,35 +54,52 @@ export async function getActiveCrawlJob(db, url) {
   `).bind(url).first();
 }
 
+// Legacy constant retained for callers that explicitly need the original
+// 24-hour policy. New cooldowns are selected from the recorded failure reason.
 export const FAILED_CRAWL_RETRY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Prevent permanent or robots-blocked URLs from being retried on every search.
- * This is a retry cooldown only; successful-document freshness still uses watchTTL.
+ * Apply per-error retry timing to a failed root job. The success watchTTL is
+ * independent and is never refreshed by these failure records.
  */
 export async function getRecentFailedCrawlJob(db, url, {
   now = Date.now(),
-  retryMs = FAILED_CRAWL_RETRY_MS,
+  retryMs,
 } = {}) {
   const job = await db.prepare(`
-    SELECT id, finished_at AS finishedAt
-    FROM crawl_jobs
-    WHERE url = ? AND status = 'failed' AND finished_at IS NOT NULL
-    ORDER BY finished_at DESC
+    SELECT
+      j.id,
+      j.finished_at AS finishedAt,
+      p.error_code AS errorCode,
+      p.upstream_http_status AS upstreamHttpStatus,
+      p.retry_after_at AS retryAfterAt
+    FROM crawl_jobs AS j
+    LEFT JOIN crawl_pages AS p
+      ON p.job_id = j.id AND p.url = j.url AND p.depth = 0
+    WHERE j.url = ? AND j.status = 'failed' AND j.finished_at IS NOT NULL
+    ORDER BY j.finished_at DESC
     LIMIT 1
   `).bind(url).first();
 
-  const failedAt = Date.parse(job?.finishedAt ?? '');
-  if (!Number.isFinite(failedAt)) return null;
+  if (!job?.finishedAt) return null;
 
-  const ageMs = now - failedAt;
-  if (ageMs >= retryMs) return null;
+  const retryAt = calculateFailureRetryAt({
+    failedAt: job.finishedAt,
+    errorCode: job.errorCode,
+    upstreamHttpStatus: job.upstreamHttpStatus,
+    retryAfterAt: job.retryAfterAt,
+    retryMs,
+  });
+  const retryAtMs = Date.parse(retryAt || '');
+  if (!Number.isFinite(retryAtMs) || retryAtMs <= now) return null;
 
   return {
     id: job.id,
     failedAt: job.finishedAt,
-    retryAt: new Date(failedAt + retryMs).toISOString(),
-    remainingMs: Math.max(0, retryMs - ageMs),
+    errorCode: job.errorCode || null,
+    upstreamHttpStatus: job.upstreamHttpStatus ?? null,
+    retryAt,
+    remainingMs: Math.max(0, retryAtMs - now),
   };
 }
 
@@ -89,7 +108,7 @@ export async function updateCrawlJob(db, id, fields) {
   const values = [];
 
   for (const [key, value] of Object.entries(fields)) {
-    if (!['status', 'attempts', 'updated_at', 'finished_at', 'document_url', 'error_code', 'error_message'].includes(key)) {
+    if (!['status', 'attempts', 'updated_at', 'finished_at', 'document_url', 'error_code', 'error_message', 'scope_origin'].includes(key)) {
       throw new TypeError(`Unsupported crawl job field: ${key}`);
     }
     assignments.push(`${key} = ?`);
@@ -204,7 +223,7 @@ export async function updateCrawlPage(db, jobId, url, fields) {
   const values = [];
 
   for (const [key, value] of Object.entries(fields)) {
-    if (!['status', 'attempts', 'updated_at', 'finished_at', 'error_code', 'error_message', 'skip_reason'].includes(key)) {
+    if (!['status', 'attempts', 'updated_at', 'finished_at', 'error_code', 'error_message', 'skip_reason', 'upstream_http_status', 'retry_after_at'].includes(key)) {
       throw new TypeError(`Unsupported crawl page field: ${key}`);
     }
     assignments.push(`${key} = ?`);
@@ -225,6 +244,7 @@ export async function saveDocumentAndCompletePage(
   pageUrl,
   document,
   now = new Date().toISOString(),
+  scopeOrigin = null,
 ) {
   const documentStatement = db.prepare(`
     INSERT INTO documents (
@@ -278,9 +298,10 @@ export async function saveDocumentAndCompletePage(
     UPDATE crawl_jobs
     SET pages_crawled = pages_crawled + 1,
         status = 'running',
-        updated_at = ?
+        updated_at = ?,
+        scope_origin = COALESCE(?, scope_origin)
     WHERE id = ?
-  `).bind(now, jobId);
+  `).bind(now, scopeOrigin, jobId);
 
   const discoveryStatement = db.prepare(`
     INSERT INTO discovered_urls (
@@ -339,6 +360,8 @@ export async function failCrawlPage(db, jobId, url, {
   attempts,
   errorCode,
   errorMessage,
+  upstreamHttpStatus = null,
+  retryAfterAt = null,
   now = new Date().toISOString(),
 }) {
   const pageStatement = db.prepare(`
@@ -348,9 +371,14 @@ export async function failCrawlPage(db, jobId, url, {
         updated_at = ?,
         finished_at = ?,
         error_code = ?,
-        error_message = ?
+        error_message = ?,
+        upstream_http_status = ?,
+        retry_after_at = ?
     WHERE job_id = ? AND url = ?
-  `).bind(attempts, now, now, errorCode, errorMessage, jobId, url);
+  `).bind(
+    attempts, now, now, errorCode, errorMessage,
+    upstreamHttpStatus, retryAfterAt, jobId, url,
+  );
 
   const jobStatement = db.prepare(`
     UPDATE crawl_jobs
@@ -462,7 +490,16 @@ export async function watchTTL(db, url, {
   now = Date.now(),
   ttlMs = WATCH_TTL_MS,
 } = {}) {
-  const document = await getDocument(db, url);
+  let document = await getDocument(db, url);
+  if (!document) {
+    const discovery = await db.prepare(`
+      SELECT resolved_url AS resolvedUrl
+      FROM discovered_urls
+      WHERE url = ? AND resolved_url IS NOT NULL
+      LIMIT 1
+    `).bind(url).first();
+    if (discovery?.resolvedUrl) document = await getDocument(db, discovery.resolvedUrl);
+  }
   const fetchedAtMs = Date.parse(document?.fetchedAt ?? '');
 
   if (!document || !Number.isFinite(fetchedAtMs)) {
