@@ -197,6 +197,16 @@ test('stops instead of repeating an unknown JSON response', async () => {
   assert.deepEqual(result.workerResponse, payload);
 });
 
+test('rejects malformed 202 JSON instead of treating it as a queued job', async () => {
+  const result = await classifyWorkerResponse(response(202, {
+    status: 'unexpected',
+  }));
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.category, 'unknown_worker_error');
+  assert.equal(result.stopSubmission, true);
+});
+
 test('stops on malformed or unrecognized successful responses', async () => {
   const malformed = await classifyWorkerResponse(response(502, 'upstream unavailable', 'text/plain'));
   const unrecognized = await classifyWorkerResponse(response(200, { status: 'unexpected' }));
