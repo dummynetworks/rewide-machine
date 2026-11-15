@@ -103,3 +103,84 @@ test('excludes related and recommendation modules from indexed body text', () =>
     /Paris Runway Prestige|MiningInsights|HCLTech Expands Climate|Popular stories/,
   );
 });
+
+
+test('prefers publisher article content over unrelated text elsewhere in the page', () => {
+  const html = `<!doctype html>
+    <html lang="en">
+      <head><title>uMngeni-uThukela Water</title></head>
+      <body>
+        <header>Global navigation and account links</header>
+        <main>
+          <article>
+            <h1>uMngeni-uThukela Water: Leading the Flow</h1>
+            <p>The bulk water service provider is improving climate resilience
+              and quality of life across the province.</p>
+            <p>Its chief executive explains the water infrastructure programme.</p>
+          </article>
+          <section class="site-rail">
+            <h2>More stories</h2>
+            <p>From Xhosa Roots to Paris Runway Prestige.</p>
+            <p>MiningInsights CVMR Builds Africa's Mineral Value Chain.</p>
+            <p>HCLTech Expands Climate.</p>
+          </section>
+        </main>
+        <footer>Footer links and legal information</footer>
+      </body>
+    </html>`;
+
+  const document = extractDocument(
+    html,
+    'https://example.com/water-profile',
+    new Headers(),
+    { maxTextLength: 1000 },
+  );
+
+  assert.match(document.text, /bulk water service provider/);
+  assert.match(document.text, /climate resilience/);
+  assert.doesNotMatch(
+    document.text,
+    /Paris Runway Prestige|MiningInsights|HCLTech Expands Climate|Global navigation/,
+  );
+});
+
+test('falls back to main and body text when semantic article containers are absent', () => {
+  const mainDocument = extractDocument(
+    '<html><body><main><h1>Local documentation</h1><p>Useful main content.</p></main><div>Outside text</div></body></html>',
+    'https://example.com/docs',
+  );
+  assert.match(mainDocument.text, /Useful main content/);
+  assert.doesNotMatch(mainDocument.text, /Outside text/);
+
+  const bodyDocument = extractDocument(
+    '<html><body><div>Plain page without semantic containers.</div></body></html>',
+    'https://example.com/plain',
+  );
+  assert.match(bodyDocument.text, /Plain page without semantic containers/);
+});
+
+
+test('classifies canonical URLs without replacing the fetched page URL', () => {
+  const sameOrigin = extractDocument(
+    '<html><head><link rel="canonical" href="/preferred"></head><body><main>Page</main></body></html>',
+    'https://example.com/source',
+  );
+  assert.equal(sameOrigin.canonicalUrl, 'https://example.com/preferred');
+  assert.equal(sameOrigin.canonicalStatus, 'same-origin');
+  assert.equal(sameOrigin.url, 'https://example.com/source');
+
+  const crossOrigin = extractDocument(
+    '<html><head><link rel="canonical" href="https://publisher.example/story"></head><body><article>Story</article></body></html>',
+    'https://syndication.example/story',
+  );
+  assert.equal(crossOrigin.canonicalUrl, 'https://publisher.example/story');
+  assert.equal(crossOrigin.canonicalStatus, 'cross-origin');
+  assert.equal(crossOrigin.url, 'https://syndication.example/story');
+
+  const invalid = extractDocument(
+    '<html><head><link rel="canonical" href="javascript:alert(1)"></head><body>Page</body></html>',
+    'https://example.com/story',
+  );
+  assert.equal(invalid.canonicalUrl, null);
+  assert.equal(invalid.canonicalStatus, 'invalid');
+});

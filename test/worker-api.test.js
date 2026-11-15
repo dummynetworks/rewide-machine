@@ -30,6 +30,7 @@ function createDb() {
             created_at: createdAt, updated_at: updatedAt,
             max_pages: maxPages, max_depth: maxDepth,
             scope_origin: new URL(url).origin,
+            force_reindex: values[7] ?? 0,
             pages_crawled: 0, pages_failed: 0, pages_skipped: 0,
           });
           changes = 1;
@@ -200,6 +201,94 @@ test('POST /v1/crawl reports the reason and retry time for a failed root job', a
   assert.equal(body.errorCode, 'UPSTREAM_HTTP_ERROR');
   assert.equal(body.upstreamHttpStatus, 503);
   assert.ok(Date.parse(body.retryAt) > Date.now());
+});
+
+test('POST /v1/crawl forceReindex bypasses freshness and creates a one-page reindex job', async () => {
+  const DB = createDb();
+  const sent = [];
+  const url = 'https://example.com/article';
+  DB.documents.set(url, {
+    url,
+    fetchedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    httpStatus: 200,
+    contentType: 'text/html',
+    title: 'Cached article',
+    description: '',
+    canonicalUrl: null,
+    language: 'en',
+    text: 'old extracted text',
+    linksJson: '[]',
+    noIndex: 0,
+    noFollow: 0,
+    indexable: 1,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const response = await submitCrawl({
+    DB,
+    CRAWL_QUEUE: { async send(message) { sent.push(message); } },
+    payload: { url, forceReindex: true },
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 202);
+  assert.equal(body.forceReindex, true);
+  assert.equal(body.maxPages, 1);
+  assert.equal(body.maxDepth, 0);
+  assert.equal(DB.jobs.get(body.jobId).force_reindex, 1);
+  assert.deepEqual(sent, [{
+    jobId: body.jobId,
+    url,
+    depth: 0,
+    parentUrl: null,
+  }]);
+});
+
+test('POST /v1/crawl promotes an already active job to forced reindex', async () => {
+  const DB = createDb();
+  const url = 'https://example.com/article';
+  const jobId = '00000000-0000-4000-8000-000000000091';
+  DB.jobs.set(jobId, {
+    id: jobId,
+    url,
+    status: 'queued',
+    created_at: new Date().toISOString(),
+    max_pages: 1,
+    max_depth: 0,
+    force_reindex: 0,
+  });
+
+  const response = await submitCrawl({
+    DB,
+    CRAWL_QUEUE: { async send() { throw new Error('must deduplicate'); } },
+    payload: { url, forceReindex: true },
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 202);
+  assert.equal(body.jobId, jobId);
+  assert.equal(body.deduplicated, true);
+  assert.equal(body.forceReindex, true);
+  assert.equal(DB.jobs.get(jobId).force_reindex, 1);
+});
+
+test('POST /v1/crawl validates forceReindex type and bounds', async () => {
+  const DB = createDb();
+  const queue = { async send() {} };
+
+  const invalidFlag = await submitCrawl({
+    DB, CRAWL_QUEUE: queue,
+    payload: { url: 'https://example.com/', forceReindex: 'true' },
+  });
+  assert.equal(invalidFlag.status, 400);
+  assert.equal((await invalidFlag.json()).error, 'INVALID_REINDEX_FLAG');
+
+  const invalidLimit = await submitCrawl({
+    DB, CRAWL_QUEUE: queue,
+    payload: { url: 'https://example.com/', forceReindex: true, maxPages: 2 },
+  });
+  assert.equal(invalidLimit.status, 400);
+  assert.equal((await invalidLimit.json()).error, 'INVALID_REINDEX_LIMITS');
 });
 
 test('POST /v1/crawl returns a fresh document without enqueueing another crawl', async () => {
