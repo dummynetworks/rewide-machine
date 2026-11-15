@@ -771,6 +771,8 @@ export default {
           crawlRequired: false,
           retryAt: recentFailure.retryAt,
           previousFailureAt: recentFailure.failedAt,
+          errorCode: recentFailure.errorCode,
+          upstreamHttpStatus: recentFailure.upstreamHttpStatus,
         }, 200);
       }
 
