@@ -120,7 +120,15 @@ Until the Queue binding and D1 tables are available, `GET /health` reports missi
 3. It publishes the starting page as a Cloudflare Queue message.
 4. The Queue consumer fetches and extracts one page, records its outgoing links as URL discoveries (including cross-origin references), then follows only eligible same-origin links up to the configured depth and page limit.
 5. Per-job URL uniqueness prevents repeated frontier entries. Each newly discovered page is inserted into D1 before it is published to the Queue.
-6. The consumer checks each frontier URL against the 24-hour D1 `watchTTL` before fetching. Fresh URLs are marked completed with `skip_reason: "fresh-within-watch-ttl"`; stale or unseen URLs are fetched. The consumer stores each fetched document and marks the corresponding frontier page complete in a D1 batch. Temporary failures are retried; terminal page failures are recorded and do not stop other pages.
+6. The consumer checks each frontier URL against the 24-hour D1 `watchTTL` before fetching. Fresh URLs are marked completed with `skip_reason: "fresh-within-watch-ttl"`; stale or unseen URLs are fetched. The Worker stores each fetched document and marks the corresponding frontier page complete in a D1 batch. Temporary failures are retried; terminal page failures are recorded and do not stop other pages.
+
+### Document text extraction
+
+The Worker removes scripts, styles, navigation, footer/form/aside elements, hidden content, and common related/recommended/trending/popular-story modules before their text enters the indexed body. These filters are shared with the local Cheerio extractor to keep both paths consistent.
+
+This is a conservative boilerplate filter, not a full readability algorithm. Publisher markup varies, so a page may still include unrelated text or have legitimate content removed when its classes use one of these generic names. Extraction quality should be validated against representative pages before changing the rules more aggressively.
+
+The consumer checks each frontier URL against the 24-hour D1 `watchTTL` before fetching. Fresh URLs are marked completed with `skip_reason: "fresh-within-watch-ttl"`; stale or unseen URLs are fetched. The consumer stores each fetched document and marks the corresponding frontier page complete in a D1 batch. Temporary failures are retried; terminal page failures are recorded and do not stop other pages.
 7. The job becomes terminal when no frontier pages remain queued or running. Read its aggregate status from `GET /v1/jobs/:jobId` and page-level results (including upstream retry metadata) from `GET /v1/jobs/:jobId/pages`.
 
 Queue delivery is at-least-once. Duplicate messages are acknowledged when their frontier page is already terminal; document writes are URL-keyed upserts. If publishing a discovered child fails after its frontier row was inserted, retrying the parent can publish that still-queued child again.
