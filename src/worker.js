@@ -320,8 +320,13 @@ async function crawlOne(input, { allowedOrigin = null, allowRootWwwAlias = false
       const location = response.headers.get('location');
       await response.body?.cancel();
 
-      if (!location || redirects === MAX_REDIRECTS) {
-        return { error: 'REDIRECT_LIMIT', message: 'Missing redirect target or maximum redirects exceeded.' };
+      if (!location || redirects + 1 >= MAX_REDIRECTS) {
+        return {
+          error: 'REDIRECT_LIMIT',
+          message: !location
+            ? 'Missing redirect target.'
+            : `Maximum redirect count of ${MAX_REDIRECTS} reached.`,
+        };
       }
 
       target = normalizePublicUrl(location, target);
