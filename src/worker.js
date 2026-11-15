@@ -1,6 +1,8 @@
 import { createRobotsPolicy } from './robots.js';
 import { insertCrawlJob, getCrawlJob, getActiveCrawlJob, getRecentFailedCrawlJob, updateCrawlJob, insertCrawlPage, getCrawlPage, getCrawlPages, updateCrawlPage, saveDocumentAndCompletePage, completeCrawlPageAsSkipped, failCrawlPage, finalizeCrawlJobIfIdle, getDocument, upsertDiscoveredUrl, watchTTL, WATCH_TTL_MS } from './job-store.js';
 import { selectCrawlLinks } from './frontier.js';
+import { isAllowedCrawlRedirect } from './redirect-policy.js';
+import { parseRetryAfterAt } from './retry-policy.js';
 
 const USER_AGENT = 'rewidebot/0.1';
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
@@ -292,7 +294,7 @@ function collectDocument(htmlResponse, finalUrl) {
   });
 }
 
-async function crawlOne(input, { allowedOrigin = null } = {}) {
+async function crawlOne(input, { allowedOrigin = null, allowRootWwwAlias = false } = {}) {
   let target = normalizePublicUrl(input);
   if (!target) {
     return { error: 'INVALID_URL', message: 'Only public HTTP and HTTPS URLs on standard ports are accepted.' };
@@ -326,15 +328,19 @@ async function crawlOne(input, { allowedOrigin = null } = {}) {
       if (!target) {
         return { error: 'INVALID_REDIRECT', message: 'Redirect target is not an allowed public HTTP URL.' };
       }
-      if (allowedOrigin && new URL(target).origin !== allowedOrigin) {
-        return { error: 'CROSS_ORIGIN_REDIRECT', message: 'Recursive crawl redirects must remain on the starting origin.' };
+      if (!isAllowedCrawlRedirect(target, allowedOrigin, { allowRootWwwAlias })) {
+        return { error: 'CROSS_ORIGIN_REDIRECT', message: 'Redirect target is outside the crawl Origin or permitted apex/www root alias.' };
       }
       continue;
     }
 
     if (!response.ok) {
       await response.body?.cancel();
-      return { error: 'UPSTREAM_HTTP_ERROR', status: response.status };
+      return {
+        error: 'UPSTREAM_HTTP_ERROR',
+        status: response.status,
+        retryAfterAt: parseRetryAfterAt(response.headers.get('retry-after')),
+      };
     }
 
     const contentType = response.headers.get('content-type') || '';
@@ -505,17 +511,29 @@ async function handleQueueMessage(message, env) {
       error_message: null,
     });
 
-    const result = await crawlOne(pageUrl, { allowedOrigin: new URL(job.url).origin });
+    const currentDepth = Number.isInteger(page.depth) ? page.depth : depthFromMessage;
+    const isRootPage = currentDepth === 0;
+    const previousScopeOrigin = job.scope_origin || new URL(job.url).origin;
+    const result = await crawlOne(pageUrl, {
+      allowedOrigin: previousScopeOrigin,
+      allowRootWwwAlias: isRootPage,
+    });
     if (result.error) {
       await failCrawlPage(env.DB, body.jobId, pageUrl, {
         attempts: message.attempts,
         errorCode: result.error,
         errorMessage: result.message || result.error,
+        upstreamHttpStatus: result.status ?? null,
+        retryAfterAt: result.retryAfterAt ?? null,
       });
       await finalizeCrawlJobIfIdle(env.DB, body.jobId);
       message.ack();
       return;
     }
+
+    const crawlScopeOrigin = isRootPage
+      ? new URL(result.url).origin
+      : previousScopeOrigin;
 
     const linkMetadata = Array.isArray(result.linkMetadata)
       ? result.linkMetadata
@@ -523,16 +541,15 @@ async function handleQueueMessage(message, env) {
     for (const link of linkMetadata) {
       await upsertDiscoveredUrl(env.DB, {
         url: link.url,
-        sourceUrl: pageUrl,
+        sourceUrl: result.url,
         sourceType: 'link',
         anchorText: link.anchorText,
       });
     }
 
-    const currentDepth = Number.isInteger(page.depth) ? page.depth : depthFromMessage;
     const candidates = selectCrawlLinks(result.links, {
-      rootUrl: job.url,
-      currentUrl: pageUrl,
+      rootUrl: crawlScopeOrigin + '/',
+      currentUrl: result.url,
       depth: currentDepth,
       maxDepth: Number(job.max_depth || 0),
       limit: 50,
@@ -559,7 +576,14 @@ async function handleQueueMessage(message, env) {
       }
     }
 
-    await saveDocumentAndCompletePage(env.DB, body.jobId, pageUrl, result);
+    await saveDocumentAndCompletePage(
+      env.DB,
+      body.jobId,
+      pageUrl,
+      result,
+      new Date().toISOString(),
+      isRootPage ? crawlScopeOrigin : null,
+    );
     await finalizeCrawlJobIfIdle(env.DB, body.jobId);
     message.ack();
   } catch (error) {
