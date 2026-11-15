@@ -154,11 +154,10 @@ export async function classifyWorkerResponse(response) {
     ? payload.error
     : null;
   const knownError = errorCode ? WORKER_ERROR_RESPONSES[errorCode] : null;
-  const unknownErrorMustStop = response.status >= 400;
   const classification = knownError || {
     status: 'failed',
     category: isObject(payload) ? 'unknown_worker_error' : 'invalid_worker_response',
-    stopSubmission: unknownErrorMustStop,
+    stopSubmission: true,
   };
 
   return {
