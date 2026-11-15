@@ -3,6 +3,7 @@ import { insertCrawlJob, getCrawlJob, getActiveCrawlJob, getRecentFailedCrawlJob
 import { selectCrawlLinks } from './frontier.js';
 import { isAllowedCrawlRedirect } from './redirect-policy.js';
 import { parseRetryAfterAt } from './retry-policy.js';
+import { REMOVE_CONTENT_SELECTORS } from './content-selectors.js';
 
 const USER_AGENT = 'rewidebot/0.1';
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
@@ -263,7 +264,7 @@ function collectDocument(htmlResponse, finalUrl) {
         document.text = addText(document.text, chunk.text, MAX_TEXT_LENGTH);
       },
     })
-    .on('script,style,noscript,template,svg,canvas,iframe,nav,footer,form,aside,[hidden],[aria-hidden="true"]', {
+    .on(REMOVE_CONTENT_SELECTORS.join(','), {
       element(element) {
         element.remove();
       },
