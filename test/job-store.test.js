@@ -280,6 +280,17 @@ test('watchTTL resolves a redirected root URL to its successfully stored final U
   });
   assert.equal(freshness.isFresh, true);
   assert.equal(freshness.document.url, finalUrl);
+  assert.equal((await getDocument(db, originalUrl)).url, finalUrl);
+});
+
+test('getDocument stops when redirected URL mappings contain a cycle', async () => {
+  const db = createFakeDb();
+  const firstUrl = 'https://first.example/';
+  const secondUrl = 'https://second.example/';
+  db.state.discoveredUrls.set(firstUrl, { url: firstUrl, resolvedUrl: secondUrl });
+  db.state.discoveredUrls.set(secondUrl, { url: secondUrl, resolvedUrl: firstUrl });
+
+  assert.equal(await getDocument(db, firstUrl), null);
 });
 
 test('watchTTL treats missing documents and documents at least 24 hours old as stale', async () => {
