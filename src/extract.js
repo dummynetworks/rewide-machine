@@ -1,6 +1,6 @@
 import * as cheerio from 'cheerio';
 import { normalizeUrl } from './url.js';
-import { REMOVE_CONTENT_SELECTORS } from './content-selectors.js';
+import { ARTICLE_BODY_SELECTORS, REMOVE_CONTENT_SELECTORS, selectArticleText } from './content-selectors.js';
 
 function directiveSet(...values) {
   const directives = new Set();
@@ -57,10 +57,16 @@ export function extractDocument(input, pageUrl, headers = new Headers(), options
 
   for (const selector of REMOVE_CONTENT_SELECTORS) $(selector).remove();
 
-  const text = ($('body').text() || $.root().text())
-    .replace(/[\t\n\r ]+/g, ' ')
-    .trim()
-    .slice(0, maxTextLength);
+  const textCandidates = {
+    articleBody: $(ARTICLE_BODY_SELECTORS.join(','))
+      .map((_, element) => $(element).text())
+      .get()
+      .join(' '),
+    article: $('article, [role="article"]').map((_, element) => $(element).text()).get().join(' '),
+    main: $('main, [role="main"]').map((_, element) => $(element).text()).get().join(' '),
+    body: $('body').text() || $.root().text(),
+  };
+  const text = selectArticleText(textCandidates, maxTextLength);
 
   const links = [];
   const seen = new Set();

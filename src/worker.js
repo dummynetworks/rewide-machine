@@ -3,7 +3,7 @@ import { insertCrawlJob, getCrawlJob, getActiveCrawlJob, getRecentFailedCrawlJob
 import { selectCrawlLinks } from './frontier.js';
 import { isAllowedCrawlRedirect } from './redirect-policy.js';
 import { parseRetryAfterAt } from './retry-policy.js';
-import { REMOVE_CONTENT_SELECTORS } from './content-selectors.js';
+import { ARTICLE_BODY_TEXT_SELECTORS, REMOVE_CONTENT_SELECTORS, selectArticleText } from './content-selectors.js';
 
 const USER_AGENT = 'rewidebot/0.1';
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
@@ -184,6 +184,12 @@ function collectDocument(htmlResponse, finalUrl) {
     if (target.length < limit) target += chunk;
     return target.slice(0, limit);
   };
+  const textCandidates = {
+    articleBody: '',
+    article: '',
+    main: '',
+    body: '',
+  };
 
   let bodyResponse;
   const linkStack = [];
@@ -259,9 +265,40 @@ function collectDocument(htmlResponse, finalUrl) {
         if (active) active.anchorText = (active.anchorText + chunk.text).slice(0, 4_000);
       },
     })
+    .on(ARTICLE_BODY_TEXT_SELECTORS.join(','), {
+      text(chunk) {
+        textCandidates.articleBody = addText(
+          textCandidates.articleBody,
+          chunk.text,
+          MAX_TEXT_LENGTH,
+        );
+      },
+    })
+    .on('article, article *, [role="article"], [role="article"] *', {
+      text(chunk) {
+        textCandidates.article = addText(
+          textCandidates.article,
+          chunk.text,
+          MAX_TEXT_LENGTH,
+        );
+      },
+    })
+    .on('main, main *, [role="main"], [role="main"] *', {
+      text(chunk) {
+        textCandidates.main = addText(
+          textCandidates.main,
+          chunk.text,
+          MAX_TEXT_LENGTH,
+        );
+      },
+    })
     .on('body, body *', {
       text(chunk) {
-        document.text = addText(document.text, chunk.text, MAX_TEXT_LENGTH);
+        textCandidates.body = addText(
+          textCandidates.body,
+          chunk.text,
+          MAX_TEXT_LENGTH,
+        );
       },
     })
     .on(REMOVE_CONTENT_SELECTORS.join(','), {
@@ -272,6 +309,7 @@ function collectDocument(htmlResponse, finalUrl) {
 
   bodyResponse = rewriter.transform(htmlResponse);
   return bodyResponse.text().then(() => {
+    document.text = selectArticleText(textCandidates, MAX_TEXT_LENGTH);
     const headerDirectives = (htmlResponse.headers.get('x-robots-tag') || '')
       .toLowerCase()
       .split(/[;,\s]+/);
