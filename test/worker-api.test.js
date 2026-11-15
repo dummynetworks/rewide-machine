@@ -69,6 +69,24 @@ function createDb() {
       },
       async first() {
         if (sql.includes('FROM documents')) return documents.get(values[0]) || null;
+        if (sql.includes('JOIN crawl_pages') && sql.includes("j.status = 'failed'") && sql.includes('j.url = ?')) {
+          const job = [...jobs.values()]
+            .filter((item) => item.url === values[0] && item.status === 'failed' && item.finished_at)
+            .sort((left, right) => Date.parse(right.finished_at) - Date.parse(left.finished_at))[0];
+          if (!job) return null;
+          const page = pages.get(pageKey(job.id, job.url));
+          return {
+            id: job.id,
+            finishedAt: job.finished_at,
+            errorCode: page?.error_code ?? null,
+            upstreamHttpStatus: page?.upstream_http_status ?? null,
+            retryAfterAt: page?.retry_after_at ?? null,
+          };
+        }
+        if (sql.includes('FROM discovered_urls') && sql.includes('resolved_url AS resolvedUrl')) {
+          const record = discoveredUrls.get(values[0]);
+          return record?.resolvedUrl ? { resolvedUrl: record.resolvedUrl } : null;
+        }
         if (sql.includes('FROM crawl_jobs') && sql.includes('url = ?')) {
           return [...jobs.values()].find((job) => (
             job.url === values[0] && ['queued', 'running'].includes(job.status)
@@ -135,6 +153,42 @@ test('POST /v1/crawl persists a root page and publishes a queue message', async 
     depth: 0,
     parentUrl: null,
   }]);
+});
+
+test('POST /v1/crawl reports the reason and retry time for a failed root job', async () => {
+  const DB = createDb();
+  const url = 'https://blocked.example/';
+  const jobId = '00000000-0000-4000-8000-000000000099';
+  const failedAt = new Date(Date.now() - 60_000).toISOString();
+  DB.jobs.set(jobId, {
+    id: jobId,
+    url,
+    status: 'failed',
+    finished_at: failedAt,
+    scope_origin: 'https://blocked.example',
+  });
+  DB.pages.set(pageKey(jobId, url), {
+    job_id: jobId,
+    url,
+    depth: 0,
+    status: 'failed',
+    error_code: 'UPSTREAM_HTTP_ERROR',
+    upstream_http_status: 503,
+    retry_after_at: null,
+  });
+
+  const response = await submitCrawl({
+    DB,
+    CRAWL_QUEUE: { async send() {} },
+    payload: { url },
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.status, 'cooldown');
+  assert.equal(body.errorCode, 'UPSTREAM_HTTP_ERROR');
+  assert.equal(body.upstreamHttpStatus, 503);
+  assert.ok(Date.parse(body.retryAt) > Date.now());
 });
 
 test('POST /v1/crawl returns a fresh document without enqueueing another crawl', async () => {
