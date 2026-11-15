@@ -22,6 +22,7 @@ Crawling is user-triggered, not scheduled. Every `POST /v1/crawl` request passes
 - A document fetched less than 24 hours ago is reused. The endpoint returns `200` with `status: "fresh"` and does not enqueue a crawl.
 - A missing document or a document at least 24 hours old is eligible for crawling.
 - If the same URL already has a queued or running root job, the endpoint returns that job instead of creating a duplicate.
+- A URL whose most recent crawl job failed is held in a separate 24-hour retry cooldown. This does not refresh the document's success TTL; an older successful document remains available while a retry is deferred.
 - The Queue consumer checks `watchTTL` again for every URL in the recursive frontier. This prevents a queued URL from being fetched if another crawl made it fresh while it was waiting.
 - The TTL is measured from the successful document `fetched_at` timestamp. Failed crawls do not refresh it, and the previous document remains available.
 
