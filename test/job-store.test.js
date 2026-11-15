@@ -145,9 +145,10 @@ function createFakeDb() {
           };
         }
         if (sql.includes("status = 'failed'") && sql.includes('FROM crawl_jobs') && sql.includes('url = ?')) {
-          return [...state.jobs.values()]
-            .filter((job) => job.url === values[0] && job.status === 'failed' && job.finished_at)
-            .sort((left, right) => Date.parse(right.finished_at) - Date.parse(left.finished_at))[0] || null;
+          const job = [...state.jobs.values()]
+            .filter((item) => item.url === values[0] && item.status === 'failed' && item.finished_at)
+            .sort((left, right) => Date.parse(right.finished_at) - Date.parse(left.finished_at))[0];
+          return job ? { id: job.id, finishedAt: job.finished_at } : null;
         }
         if (sql.includes('FROM crawl_jobs') && sql.includes('url = ?')) {
           return [...state.jobs.values()].find((job) => (
