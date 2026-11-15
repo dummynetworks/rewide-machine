@@ -1,5 +1,5 @@
 import { createRobotsPolicy } from './robots.js';
-import { insertCrawlJob, getCrawlJob, getActiveCrawlJob, updateCrawlJob, insertCrawlPage, getCrawlPage, getCrawlPages, updateCrawlPage, saveDocumentAndCompletePage, completeCrawlPageAsSkipped, failCrawlPage, finalizeCrawlJobIfIdle, getDocument, watchTTL, WATCH_TTL_MS } from './job-store.js';
+import { insertCrawlJob, getCrawlJob, getActiveCrawlJob, updateCrawlJob, insertCrawlPage, getCrawlPage, getCrawlPages, updateCrawlPage, saveDocumentAndCompletePage, completeCrawlPageAsSkipped, failCrawlPage, finalizeCrawlJobIfIdle, getDocument, upsertDiscoveredUrl, watchTTL, WATCH_TTL_MS } from './job-store.js';
 import { selectCrawlLinks } from './frontier.js';
 
 const USER_AGENT = 'rewidebot/0.1';
@@ -141,21 +141,18 @@ async function getRobotsPolicy(targetUrl) {
 
     const body = response.ok ? await readLimitedBody(response, MAX_ROBOTS_BYTES) : null;
     if (response.ok && body === null) {
-      policy = createRobotsPolicy({
-        robotsUrl, status: 0, userAgent: USER_AGENT,
-      });
-    } else {
-      policy = createRobotsPolicy({
-        robotsUrl,
-        status: response.status,
-        body: body ? new TextDecoder().decode(body) : '',
-        userAgent: USER_AGENT,
-      });
+      throw new Error('robots.txt exceeded the configured size limit.');
     }
-  } catch {
+
     policy = createRobotsPolicy({
-      robotsUrl, status: 0, userAgent: USER_AGENT,
+      robotsUrl,
+      status: response.status,
+      body: body ? new TextDecoder().decode(body) : '',
+      userAgent: USER_AGENT,
     });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'Network error.';
+    throw new Error('ROBOTS_FETCH_TEMPORARY_FAILURE: ' + reason);
   }
 
   robotsCache.set(origin, {
@@ -165,7 +162,6 @@ async function getRobotsPolicy(targetUrl) {
 
   return policy;
 }
-
 function collectDocument(htmlResponse, finalUrl) {
   const document = {
     url: finalUrl,
@@ -175,6 +171,7 @@ function collectDocument(htmlResponse, finalUrl) {
     language: null,
     text: '',
     links: [],
+    linkMetadata: [],
     noIndex: false,
     noFollow: false,
     indexable: true,
@@ -186,6 +183,7 @@ function collectDocument(htmlResponse, finalUrl) {
   };
 
   let bodyResponse;
+  const linkStack = [];
   const rewriter = new HTMLRewriter()
     .on('html', {
       element(element) {
@@ -232,9 +230,30 @@ function collectDocument(htmlResponse, finalUrl) {
 
         const href = element.getAttribute('href');
         const link = href ? normalizePublicUrl(href, finalUrl) : null;
-        if (link && link !== finalUrl && !document.links.includes(link)) {
-          document.links.push(link);
-        }
+        if (!link || link === finalUrl) return;
+
+        if (!document.links.includes(link)) document.links.push(link);
+
+        const entry = { url: link, anchorText: '' };
+        linkStack.push(entry);
+        element.onEndTag(() => {
+          const position = linkStack.lastIndexOf(entry);
+          if (position !== -1) linkStack.splice(position, 1);
+
+          const anchorText = entry.anchorText.replace(/\s+/g, ' ').trim().slice(0, 2_000);
+          const existing = document.linkMetadata.find((item) => item.url === link);
+          if (existing) {
+            if (anchorText && !existing.anchorText.includes(anchorText)) {
+              existing.anchorText = (existing.anchorText + ' ' + anchorText).trim().slice(0, 2_000);
+            }
+          } else {
+            document.linkMetadata.push({ url: link, anchorText });
+          }
+        });
+      },
+      text(chunk) {
+        const active = linkStack[linkStack.length - 1];
+        if (active) active.anchorText = (active.anchorText + chunk.text).slice(0, 4_000);
       },
     })
     .on('body, body *', {
@@ -265,7 +284,10 @@ function collectDocument(htmlResponse, finalUrl) {
     document.description = document.description.replace(/\s+/g, ' ').trim();
     document.text = document.text.replace(/[\t\n\r ]+/g, ' ').trim();
     document.indexable = !document.noIndex;
-    if (document.noFollow) document.links = [];
+    if (document.noFollow) {
+      document.links = [];
+      document.linkMetadata = [];
+    }
     return document;
   });
 }
@@ -495,6 +517,18 @@ async function handleQueueMessage(message, env) {
       return;
     }
 
+    const linkMetadata = Array.isArray(result.linkMetadata)
+      ? result.linkMetadata
+      : result.links.map((url) => ({ url, anchorText: '' }));
+    for (const link of linkMetadata) {
+      await upsertDiscoveredUrl(env.DB, {
+        url: link.url,
+        sourceUrl: pageUrl,
+        sourceType: 'link',
+        anchorText: link.anchorText,
+      });
+    }
+
     const currentDepth = Number.isInteger(page.depth) ? page.depth : depthFromMessage;
     const candidates = selectCrawlLinks(result.links, {
       rootUrl: job.url,
@@ -658,6 +692,12 @@ export default {
       if (parsed.error) return json({ error: parsed.error }, parsed.error === 'REQUEST_TOO_LARGE' ? 413 : 400);
       const checked = requestUrl(parsed.payload);
       if (checked.error) return json({ error: checked.error, message: checked.message }, 400);
+
+      try {
+        await upsertDiscoveredUrl(env.DB, { url: checked.url, sourceType: 'seed' });
+      } catch {
+        return json({ error: 'DISCOVERY_RECORD_FAILED' }, 503);
+      }
 
       let freshness;
       let activeJob;

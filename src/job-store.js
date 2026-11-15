@@ -93,6 +93,49 @@ export async function insertCrawlPage(db, {
   return Number(result?.meta?.changes || 0) > 0;
 }
 
+export async function upsertDiscoveredUrl(db, {
+  url,
+  sourceUrl = null,
+  sourceType = 'seed',
+  anchorText = '',
+  now = new Date().toISOString(),
+}) {
+  if (typeof url !== 'string' || url.length > 2_048) {
+    throw new TypeError('A normalized URL is required for discovery storage.');
+  }
+  if (!['seed', 'link'].includes(sourceType)) {
+    throw new TypeError('Unsupported discovery source type.');
+  }
+
+  const safeSourceUrl = typeof sourceUrl === 'string' && sourceUrl.length <= 2_048
+    ? sourceUrl
+    : null;
+  const safeAnchorText = typeof anchorText === 'string'
+    ? anchorText.replace(/\s+/g, ' ').trim().slice(0, 2_000)
+    : '';
+
+  await db.prepare(`
+    INSERT INTO discovered_urls (
+      url, resolved_url, source_url, source_type, title, description,
+      anchor_text, noindex_status, discovered_at, updated_at
+    ) VALUES (?, NULL, ?, ?, '', '', ?, 'unknown', ?, ?)
+    ON CONFLICT(url) DO UPDATE SET
+      source_url = COALESCE(discovered_urls.source_url, excluded.source_url),
+      source_type = CASE
+        WHEN discovered_urls.source_type = 'seed' THEN 'seed'
+        ELSE excluded.source_type
+      END,
+      anchor_text = CASE
+        WHEN excluded.anchor_text = '' THEN discovered_urls.anchor_text
+        WHEN discovered_urls.anchor_text = '' THEN substr(excluded.anchor_text, 1, 2_000)
+        WHEN instr(discovered_urls.anchor_text, excluded.anchor_text) > 0
+          THEN discovered_urls.anchor_text
+        ELSE substr(discovered_urls.anchor_text || ' ' || excluded.anchor_text, 1, 2_000)
+      END,
+      updated_at = excluded.updated_at
+  `).bind(url, safeSourceUrl, sourceType, safeAnchorText, now, now).run();
+}
+
 export async function getCrawlPage(db, jobId, url) {
   return db.prepare(`
     SELECT ${PAGE_COLUMNS}
@@ -207,7 +250,28 @@ export async function saveDocumentAndCompletePage(
     WHERE id = ?
   `).bind(now, jobId);
 
-  await db.batch([documentStatement, pageStatement, jobStatement]);
+  const discoveryStatement = db.prepare(`
+    INSERT INTO discovered_urls (
+      url, resolved_url, source_url, source_type, title, description,
+      anchor_text, noindex_status, discovered_at, updated_at
+    ) VALUES (?, ?, NULL, 'seed', ?, ?, '', ?, ?, ?)
+    ON CONFLICT(url) DO UPDATE SET
+      resolved_url = excluded.resolved_url,
+      title = excluded.title,
+      description = excluded.description,
+      noindex_status = excluded.noindex_status,
+      updated_at = excluded.updated_at
+  `).bind(
+    pageUrl,
+    document.url !== pageUrl ? document.url : null,
+    document.title || '',
+    document.description || '',
+    document.noIndex ? 'noindex' : 'indexable',
+    document.fetchedAt || now,
+    now,
+  );
+
+  await db.batch([documentStatement, pageStatement, jobStatement, discoveryStatement]);
 }
 
 export async function completeCrawlPageAsSkipped(
@@ -338,7 +402,26 @@ export async function saveDocumentAndCompleteJob(db, jobId, document, now = new 
     WHERE id = ?
   `).bind(now, now, document.url, jobId);
 
-  await db.batch([documentStatement, jobStatement]);
+  const discoveryStatement = db.prepare(`
+    INSERT INTO discovered_urls (
+      url, resolved_url, source_url, source_type, title, description,
+      anchor_text, noindex_status, discovered_at, updated_at
+    ) VALUES (?, NULL, NULL, 'seed', ?, ?, '', ?, ?, ?)
+    ON CONFLICT(url) DO UPDATE SET
+      title = excluded.title,
+      description = excluded.description,
+      noindex_status = excluded.noindex_status,
+      updated_at = excluded.updated_at
+  `).bind(
+    document.url,
+    document.title || '',
+    document.description || '',
+    document.noIndex ? 'noindex' : 'indexable',
+    document.fetchedAt || now,
+    now,
+  );
+
+  await db.batch([documentStatement, jobStatement, discoveryStatement]);
 }
 
 export const WATCH_TTL_MS = 24 * 60 * 60 * 1000;

@@ -31,12 +31,36 @@ test('treats a missing robots file as no published restrictions', () => {
   assert.equal(policy.allowed('https://example.com/'), true);
 });
 
-test('fails closed when robots cannot be retrieved successfully', () => {
-  const policy = createRobotsPolicy({
-    robotsUrl: 'https://example.com/robots.txt',
-    status: 503,
-    userAgent: 'rewidebot/0.1',
-  });
-  assert.equal(policy.mode, 'blocked');
-  assert.equal(policy.allowed('https://example.com/'), false);
+test('treats ordinary 4xx robots responses as unavailable, but not HTTP 429', () => {
+  for (const status of [401, 403, 404, 410]) {
+    const policy = createRobotsPolicy({
+      robotsUrl: 'https://example.com/robots.txt',
+      status,
+      userAgent: 'rewidebot/0.1',
+    });
+    assert.equal(policy.mode, 'unavailable');
+    assert.equal(policy.allowed('https://example.com/'), true);
+  }
+
+  assert.throws(
+    () => createRobotsPolicy({
+      robotsUrl: 'https://example.com/robots.txt',
+      status: 429,
+      userAgent: 'rewidebot/0.1',
+    }),
+    /ROBOTS_FETCH_TEMPORARY_FAILURE/,
+  );
+});
+
+test('does not turn server or network failures into a false robots disallow', () => {
+  for (const status of [0, 301, 500, 503]) {
+    assert.throws(
+      () => createRobotsPolicy({
+        robotsUrl: 'https://example.com/robots.txt',
+        status,
+        userAgent: 'rewidebot/0.1',
+      }),
+      /ROBOTS_FETCH_TEMPORARY_FAILURE/,
+    );
+  }
 });

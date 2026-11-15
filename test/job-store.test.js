@@ -15,6 +15,7 @@ import {
   finalizeCrawlJobIfIdle,
   saveDocumentAndCompleteJob,
   getDocument,
+  upsertDiscoveredUrl,
 } from '../src/job-store.js';
 
 function createFakeDb() {
@@ -22,6 +23,7 @@ function createFakeDb() {
     jobs: new Map(),
     pages: new Map(),
     documents: new Map(),
+    discoveredUrls: new Map(),
     batches: [],
   };
 
@@ -90,6 +92,27 @@ function createFakeDb() {
             }
             changes = 1;
           }
+        } else if (sql.includes('INSERT INTO discovered_urls')) {
+          const url = values[0];
+          const previous = state.discoveredUrls.get(url) || { url, anchorText: '', noindexStatus: 'unknown' };
+          if (sql.includes("'unknown', ?, ?")) {
+            const [, sourceUrl, sourceType, anchorText, discoveredAt, updatedAt] = values;
+            previous.sourceUrl = previous.sourceUrl || sourceUrl;
+            previous.sourceType = previous.sourceType === 'seed' ? 'seed' : sourceType;
+            if (anchorText && !previous.anchorText.includes(anchorText)) previous.anchorText = (previous.anchorText + ' ' + anchorText).trim().slice(0, 2000);
+            previous.discoveredAt = previous.discoveredAt || discoveredAt;
+            previous.updatedAt = updatedAt;
+          } else {
+            const [, resolvedUrl, title, description, noindexStatus, discoveredAt, updatedAt] = values;
+            previous.resolvedUrl = resolvedUrl;
+            previous.title = title;
+            previous.description = description;
+            previous.noindexStatus = noindexStatus;
+            previous.discoveredAt = previous.discoveredAt || discoveredAt;
+            previous.updatedAt = updatedAt;
+          }
+          state.discoveredUrls.set(url, previous);
+          changes = 1;
         } else if (sql.includes('INSERT INTO documents')) {
           const [url, fetchedAt, httpStatus, contentType, title, description,
             canonicalUrl, language, text, linksJson, noIndex, noFollow,
@@ -161,6 +184,30 @@ const sampleDocument = {
   noFollow: false,
   indexable: true,
 };
+
+test('keeps blocked or not-yet-crawled discovered URLs in UNKNOWN state and merges anchor text', async () => {
+  const db = createFakeDb();
+
+  await upsertDiscoveredUrl(db, {
+    url: 'https://example.com/private',
+    sourceUrl: 'https://example.com/',
+    sourceType: 'link',
+    anchorText: 'Private documentation',
+    now: '2026-11-14T00:00:00.000Z',
+  });
+  await upsertDiscoveredUrl(db, {
+    url: 'https://example.com/private',
+    sourceUrl: 'https://other.example/',
+    sourceType: 'link',
+    anchorText: 'Access policy',
+    now: '2026-11-14T00:00:01.000Z',
+  });
+
+  const record = db.state.discoveredUrls.get('https://example.com/private');
+  assert.equal(record.noindexStatus, 'unknown');
+  assert.equal(record.sourceUrl, 'https://example.com/');
+  assert.equal(record.anchorText, 'Private documentation Access policy');
+});
 
 test('insert and retrieve a queued crawl job', async () => {
   const db = createFakeDb();
@@ -263,7 +310,8 @@ test('stores a page document and completes its frontier row in one D1 batch', as
   assert.deepEqual(saved.links, sampleDocument.links);
   assert.equal(page.status, 'completed');
   assert.equal(job.pages_crawled, 1);
-  assert.deepEqual(db.state.batches, [3]);
+  assert.equal(db.state.discoveredUrls.get(sampleDocument.url).noindexStatus, 'indexable');
+  assert.deepEqual(db.state.batches, [4]);
 });
 
 test('finalizes an idle crawl job based on successful pages', async () => {
@@ -288,5 +336,6 @@ test('stores legacy document completion in one D1 batch', async () => {
   assert.deepEqual(saved.links, sampleDocument.links);
   assert.equal(job.status, 'completed');
   assert.equal(job.document_url, sampleDocument.url);
-  assert.deepEqual(db.state.batches, [2]);
+  assert.equal(db.state.discoveredUrls.get(sampleDocument.url).noindexStatus, 'indexable');
+  assert.deepEqual(db.state.batches, [3]);
 });

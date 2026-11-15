@@ -1,14 +1,17 @@
 import robotsParser from 'robots-parser';
 
-const DENY_ALL = 'User-agent: *\nDisallow: /';
-
 export function createRobotsPolicy({
   robotsUrl,
   status,
   body = '',
   userAgent,
 }) {
-  if (status === 404 || status === 410) {
+  if (
+    Number.isInteger(status)
+    && status >= 400
+    && status < 500
+    && status !== 429
+  ) {
     return {
       mode: 'unavailable',
       allowed: () => true,
@@ -18,13 +21,10 @@ export function createRobotsPolicy({
   }
 
   if (!Number.isInteger(status) || status < 200 || status >= 300) {
-    const parser = robotsParser(robotsUrl, DENY_ALL);
-    return {
-      mode: 'blocked',
-      allowed: (url) => parser.isAllowed(url, userAgent) === true,
-      crawlDelaySeconds: null,
-      sitemaps: [],
-    };
+    throw new Error(
+      'ROBOTS_FETCH_TEMPORARY_FAILURE: robots.txt could not be retrieved (HTTP '
+      + String(status) + ').',
+    );
   }
 
   const parser = robotsParser(robotsUrl, body);

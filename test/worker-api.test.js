@@ -8,6 +8,7 @@ function createDb() {
   const jobs = new Map();
   const pages = new Map();
   const documents = new Map();
+  const discoveredUrls = new Map();
   const pageKey = (jobId, url) => `${jobId}:${url}`;
 
   function makeStatement(sql, values = []) {
@@ -18,7 +19,11 @@ function createDb() {
       async run() {
         let changes = 0;
 
-        if (sql.includes('INSERT INTO crawl_jobs')) {
+        if (sql.includes('INSERT INTO discovered_urls')) {
+          const [url, sourceUrl, sourceType, anchorText, discoveredAt, updatedAt] = values;
+          discoveredUrls.set(url, { url, sourceUrl, sourceType, anchorText, noindexStatus: 'unknown', discoveredAt, updatedAt });
+          changes = 1;
+        } else if (sql.includes('INSERT INTO crawl_jobs')) {
           const [id, url, createdAt, updatedAt, maxPages, maxDepth] = values;
           jobs.set(id, {
             id, url, status: 'queued', attempts: 0,
@@ -83,6 +88,7 @@ function createDb() {
     jobs,
     pages,
     documents,
+    discoveredUrls,
     prepare: (sql) => makeStatement(sql),
     async batch(statements) {
       for (const statement of statements) await statement.run();
@@ -120,6 +126,7 @@ test('POST /v1/crawl persists a root page and publishes a queue message', async 
   assert.equal(body.maxDepth, 0);
   assert.equal(DB.jobs.get(body.jobId).status, 'queued');
   assert.equal(DB.pages.size, 1);
+  assert.equal(DB.discoveredUrls.has('https://example.com/'), true);
   assert.deepEqual(sent, [{
     jobId: body.jobId,
     url: 'https://example.com/',

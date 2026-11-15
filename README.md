@@ -49,7 +49,7 @@ To follow links on the same origin, set bounded crawl limits:
 - `maxDepth`: maximum link distance from the starting URL; integer from 0 to 5. Defaults to 0 for a single-page crawl and 2 when `maxPages` is greater than 1.
 - Scope is same-origin only. Links to other hosts are not added to the frontier.
 - URL fragments are removed before deduplication. Each normalized URL is added at most once per job.
-- Every fetched page is checked against that page origin's `robots.txt`. A robots denial is recorded as a page failure and does not stop other queued pages.
+- Every fetched page is checked against that page origin's `robots.txt`. A robots denial is recorded as a page failure and does not stop other queued pages. The URL remains in the discovery index with `noindex_status = 'unknown'`; robots disallow is never treated as proof of `noindex`.
 - Per-page errors are visible in the pages endpoint. A crawl job completes when its frontier is drained and at least one page succeeded; it fails when no page succeeded.
 
 Example response:
@@ -103,6 +103,7 @@ Migrations:
 - `0002_recursive_crawl.sql` adds crawl limits and page counters to `crawl_jobs`, and creates the per-job `crawl_pages` frontier.
 - `0003_documents_fts.sql` creates a SQLite FTS5 full-text index over document titles, descriptions, and extracted text. Triggers keep it synchronized with document inserts, updates, and deletes; the migration rebuilds the index from documents already stored.
 - `0004_on_demand_ttl.sql` adds per-job skipped-page accounting and enforces one active root crawl job per normalized URL.
+- `0005_discovered_urls.sql` stores discovered URLs separately from fetched documents and adds an FTS5 index for URL, title, description, and referring-link text. A blocked or failed crawl remains searchable as `UNKNOWN`; a fetched `noindex` page is excluded.
 
 After the Queue exists and migrations have been applied, deploy the Worker. Wrangler configures the producer binding `CRAWL_QUEUE` and the consumer for `rewide-crawl-queue` from `wrangler.jsonc`.
 
@@ -115,7 +116,7 @@ Until the Queue binding and D1 tables are available, `GET /health` reports missi
 1. The authenticated API validates the starting URL and crawl limits.
 2. It creates a crawl job and inserts the starting URL into the D1 frontier at depth 0.
 3. It publishes the starting page as a Cloudflare Queue message.
-4. The Queue consumer fetches and extracts one page, then discovers eligible same-origin links up to the configured depth and page limit.
+4. The Queue consumer fetches and extracts one page, records its outgoing links as URL discoveries (including cross-origin references), then follows only eligible same-origin links up to the configured depth and page limit.
 5. Per-job URL uniqueness prevents repeated frontier entries. Each newly discovered page is inserted into D1 before it is published to the Queue.
 6. The consumer checks each frontier URL against the 24-hour D1 `watchTTL` before fetching. Fresh URLs are marked completed with `skip_reason: "fresh-within-watch-ttl"`; stale or unseen URLs are fetched. The consumer stores each fetched document and marks the corresponding frontier page complete in a D1 batch. Temporary failures are retried; terminal page failures are recorded and do not stop other pages.
 7. The job becomes terminal when no frontier pages remain queued or running. Read its aggregate status from `GET /v1/jobs/:jobId` and page-level results from `GET /v1/jobs/:jobId/pages`.
